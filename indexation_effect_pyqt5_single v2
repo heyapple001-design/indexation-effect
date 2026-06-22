@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -317,167 +316,202 @@ def process_one_base(df_base: pd.DataFrame,
                      target_col: str,
                      selected_filters: dict):
     
+    print(f"=== process_one_base started ===")
+    print(f"target_col: {target_col}")
+    print(f"available_group_cols: {available_group_cols}")
+    print(f"charges_mode: {charges_mode}")
+    
     if not selected_filters or not selected_filters.get("date") or selected_filters.get("selected") is None:
+        print("Нет фильтров")
         return None
     
     selected_date = selected_filters["date"]
     selected_segments = selected_filters.get("selected") or {}
     selected_services = selected_segments.get(RPT_COL_SERVICE, [])
     
-    if charges_mode == MODE_EXTERNAL:
-        pivot = calc_pivot_external(df_base, df_amount, base_col, id_col, amount_col, available_group_cols)
-    else:
-        pivot = calc_pivot_inbase(df_base, base_col, current_col, available_group_cols)
+    print(f"selected_date: {selected_date}")
+    print(f"selected_services: {selected_services}")
     
-    if pivot.empty:
-        return 0, 0, [], [], [], 0.0, df_report
-    
-    total_rpt = len(df_report)
-    
-    # Строим словарь отчёта для быстрого поиска
-    report_dict = defaultdict(list)
-    for idx, r in df_report.iterrows():
-        svc = norm_text(r[RPT_COL_SERVICE]) if RPT_COL_SERVICE in r.index else ""
-        mrf = norm_text(r[RPT_COL_MRF]) if RPT_COL_MRF in r.index else ""
-        rf = canonical_rf_from_display(r[RPT_COL_RF]) if RPT_COL_RF in r.index else ""
-        seg = norm_text(r[RPT_COL_SEGMENT]) if RPT_COL_SEGMENT in r.index else ""
-        sub = norm_text(r[RPT_COL_SUBSEG]) if RPT_COL_SUBSEG in r.index else ""
-        key = (svc, mrf, rf, seg, sub)
-        report_dict[key].append(idx)
-    
-    # Строим lookup для процентов
-    pct_col_report = find_col_name(df_report, RPT_COL_PCT)
-    pct_lookup = {}
-    if pct_col_report and total_rpt > 0:
-        for key_full, ridxs in report_dict.items():
-            mrf_k = key_full[1]
-            rf_k = key_full[2]
-            for ridx in ridxs:
-                val = df_report.loc[ridx, pct_col_report]
-                if pd.notna(val) and str(val).strip() not in ("", "0", "0.0"):
-                    pct_lookup[(mrf_k, rf_k)] = fmt_pct(val)
-                    break
-    
-    filter_mrfs = set(selected_segments.get("МРФ", []))
-    filter_rfs = set(selected_segments.get("РФ", []))
-    filter_segments = set(selected_segments.get("Краткий Сегмент", []))
-    filter_subsegs = set(selected_segments.get("Подсегмент", []))
-    
-    not_found_indices = []
-    
-    # Помечаем строки, которые не будут найдены в базе
-    if total_rpt > 0:
-        pivot_keys = set()
+    try:
+        if charges_mode == MODE_EXTERNAL:
+            print("Режим external")
+            pivot = calc_pivot_external(df_base, df_amount, base_col, id_col, amount_col, available_group_cols)
+        else:
+            print("Режим inbase")
+            pivot = calc_pivot_inbase(df_base, base_col, current_col, available_group_cols)
+        
+        print(f"Pivot shape: {pivot.shape}")
+        
+        if pivot.empty:
+            print("Pivot пустой")
+            return 0, 0, [], [], [], 0.0, df_report
+        
+        # Проверяем, есть ли колонка Эффект_тыс
+        if 'Эффект_тыс' not in pivot.columns:
+            print(f"Колонка 'Эффект_тыс' не найдена. Доступные колонки: {list(pivot.columns)}")
+            if 'Эффект_руб' in pivot.columns:
+                pivot['Эффект_тыс'] = (pivot['Эффект_руб'] / 1000).round(3)
+            else:
+                print("Колонка 'Эффект_руб' тоже не найдена")
+                pivot['Эффект_тыс'] = 0
+        
+        total_rpt = len(df_report)
+        print(f"Длина отчета: {total_rpt}")
+        
+        # Строим словарь отчёта для быстрого поиска
+        report_dict = defaultdict(list)
+        for idx, r in df_report.iterrows():
+            svc = norm_text(r[RPT_COL_SERVICE]) if RPT_COL_SERVICE in r.index else ""
+            mrf = norm_text(r[RPT_COL_MRF]) if RPT_COL_MRF in r.index else ""
+            rf = canonical_rf_from_display(r[RPT_COL_RF]) if RPT_COL_RF in r.index else ""
+            seg = norm_text(r[RPT_COL_SEGMENT]) if RPT_COL_SEGMENT in r.index else ""
+            sub = norm_text(r[RPT_COL_SUBSEG]) if RPT_COL_SUBSEG in r.index else ""
+            key = (svc, mrf, rf, seg, sub)
+            report_dict[key].append(idx)
+        
+        print(f"Словарь отчета построен, ключей: {len(report_dict)}")
+        
+        # Строим lookup для процентов
+        pct_col_report = find_col_name(df_report, RPT_COL_PCT)
+        pct_lookup = {}
+        if pct_col_report and total_rpt > 0:
+            for key_full, ridxs in report_dict.items():
+                mrf_k = key_full[1]
+                rf_k = key_full[2]
+                for ridx in ridxs:
+                    val = df_report.loc[ridx, pct_col_report]
+                    if pd.notna(val) and str(val).strip() not in ("", "0", "0.0"):
+                        pct_lookup[(mrf_k, rf_k)] = fmt_pct(val)
+                        break
+        
+        filter_mrfs = set(selected_segments.get(RPT_COL_MRF, []))
+        filter_rfs = set(selected_segments.get(RPT_COL_RF, []))
+        filter_segments = set(selected_segments.get(RPT_COL_SEGMENT, []))
+        filter_subsegs = set(selected_segments.get(RPT_COL_SUBSEG, []))
+        
+        print(f"Фильтры: МРФ={filter_mrfs}, РФ={filter_rfs}")
+        
+        not_found_indices = []
+        
+        # Помечаем строки, которые не будут найдены в базе
+        if total_rpt > 0:
+            pivot_keys = set()
+            for _, pr in pivot.iterrows():
+                mrf_ = norm_text(pr[BASE_COL_MRF]) if BASE_COL_MRF in pr.index else ""
+                rf_ = canonical_rf_from_display(pr[BASE_COL_RF]) if BASE_COL_RF in pr.index else ""
+                seg_ = norm_text(pr[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in pr.index else ""
+                sub_ = norm_text(pr[BASE_COL_SUBSEG]) if BASE_COL_SUBSEG in pr.index else ""
+                pivot_keys.add((mrf_, rf_, seg_, sub_))
+            
+            for key_full, ridxs in report_dict.items():
+                row_mrf = key_full[1]
+                row_rf = key_full[2]
+                row_seg = key_full[3]
+                row_sub = key_full[4]
+                
+                if filter_mrfs and row_mrf not in filter_mrfs:
+                    continue
+                if filter_rfs and row_rf not in filter_rfs:
+                    continue
+                if filter_segments and row_seg not in filter_segments:
+                    continue
+                if filter_subsegs and row_sub not in filter_subsegs:
+                    continue
+                
+                key_no_svc = (row_mrf, row_rf, row_seg, row_sub)
+                if key_no_svc not in pivot_keys:
+                    for ridx in ridxs:
+                        try:
+                            cur = df_report.loc[ridx, target_col]
+                            if pd.isna(cur):
+                                df_report.loc[ridx, target_col] = 0
+                        except (TypeError, KeyError, IndexError):
+                            pass
+                        not_found_indices.append(ridx)
+        
+        updated_count = 0
+        added_count = 0
+        matched_indices = []
+        added_indices = []
+        
+        svcs_check = selected_services if selected_services else {k[0] for k in report_dict}
+        if total_rpt == 0:
+            svcs_check = None
+        
         for _, pr in pivot.iterrows():
             mrf_ = norm_text(pr[BASE_COL_MRF]) if BASE_COL_MRF in pr.index else ""
             rf_ = canonical_rf_from_display(pr[BASE_COL_RF]) if BASE_COL_RF in pr.index else ""
             seg_ = norm_text(pr[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in pr.index else ""
             sub_ = norm_text(pr[BASE_COL_SUBSEG]) if BASE_COL_SUBSEG in pr.index else ""
-            pivot_keys.add((mrf_, rf_, seg_, sub_))
-        
-        for key_full, ridxs in report_dict.items():
-            row_mrf = key_full[1]
-            row_rf = key_full[2]
-            row_seg = key_full[3]
-            row_sub = key_full[4]
             
-            if filter_mrfs and row_mrf not in filter_mrfs:
-                continue
-            if filter_rfs and row_rf not in filter_rfs:
-                continue
-            if filter_segments and row_seg not in filter_segments:
-                continue
-            if filter_subsegs and row_sub not in filter_subsegs:
+            # Проверка фильтров
+            ok = True
+            if filter_mrfs and mrf_ not in filter_mrfs:
+                ok = False
+            if ok and filter_rfs and rf_ not in filter_rfs:
+                ok = False
+            if ok and filter_segments and seg_ not in filter_segments:
+                ok = False
+            if ok and filter_subsegs and sub_ not in filter_subsegs:
+                ok = False
+            
+            if not ok:
                 continue
             
-            key_no_svc = (row_mrf, row_rf, row_seg, row_sub)
-            if key_no_svc not in pivot_keys:
-                for ridx in ridxs:
-                    try:
-                        cur = df_report.loc[ridx, target_col]
-                        if pd.isna(cur):
-                            df_report.loc[ridx, target_col] = 0
-                    except (TypeError, KeyError, IndexError):
-                        pass
-                    not_found_indices.append(ridx)
-    
-    updated_count = 0
-    added_count = 0
-    matched_indices = []
-    added_indices = []
-    skipped_by_filter = []
-    
-    svcs_check = selected_services if selected_services else {k[0] for k in report_dict}
-    if total_rpt == 0:
-        svcs_check = None
-    
-    for _, pr in pivot.iterrows():
-        mrf_ = norm_text(pr[BASE_COL_MRF]) if BASE_COL_MRF in pr.index else ""
-        rf_ = canonical_rf_from_display(pr[BASE_COL_RF]) if BASE_COL_RF in pr.index else ""
-        seg_ = norm_text(pr[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in pr.index else ""
-        sub_ = norm_text(pr[BASE_COL_SUBSEG]) if BASE_COL_SUBSEG in pr.index else ""
-        
-        # Проверка фильтров
-        ok = True
-        if filter_mrfs and mrf_ not in filter_mrfs:
-            ok = False
-        if ok and filter_rfs and rf_ not in filter_rfs:
-            ok = False
-        if ok and filter_segments and seg_ not in filter_segments:
-            ok = False
-        if ok and filter_subsegs and sub_ not in filter_subsegs:
-            ok = False
-        
-        if not ok:
-            continue
-        
-        eff = pr['Эффект_тыс']
-        
-        if total_rpt > 0:
-            sc_list = list(svcs_check) if svcs_check else [None]
-            found_any = False
+            eff = pr['Эффект_тыс']
             
-            for svc in sc_list:
-                key = (svc, mrf_, rf_, seg_, sub_)
-                if key in report_dict:
-                    for ridx in report_dict[key]:
-                        df_report.loc[ridx, target_col] = eff
-                        matched_indices.append(ridx)
-                        updated_count += 1
-                        found_any = True
-            
-            if not found_any:
-                key_no_svc = (mrf_, rf_, seg_, sub_)
-                existing_no_svc = {(k[1], k[2], k[3], k[4]) for k in report_dict}
-                if key_no_svc in existing_no_svc:
-                    for key_full, ridxs in report_dict.items():
-                        if (key_full[1], key_full[2], key_full[3], key_full[4]) == key_no_svc:
-                            for ridx in ridxs:
-                                df_report.loc[ridx, target_col] = eff
-                                matched_indices.append(ridx)
-                                updated_count += 1
-                                found_any = True
-                            break
+            if total_rpt > 0:
+                sc_list = list(svcs_check) if svcs_check else [None]
+                found_any = False
+                
+                for svc in sc_list:
+                    key = (svc, mrf_, rf_, seg_, sub_)
+                    if key in report_dict:
+                        for ridx in report_dict[key]:
+                            df_report.loc[ridx, target_col] = eff
+                            matched_indices.append(ridx)
+                            updated_count += 1
+                            found_any = True
                 
                 if not found_any:
-                    svc_val = list(svcs_check)[0] if svcs_check else ""
-                    new_row = _build_new_row(df_report, pr, svc_val, selected_date, target_col, eff, pct_lookup)
-                    df_report = pd.concat([df_report, pd.DataFrame([new_row])], ignore_index=True)
-                    added_indices.append(len(df_report) - 1)
-                    added_count += 1
-        else:
-            if BASE_COL_SERVICE in pr.index and pd.notna(pr[BASE_COL_SERVICE]):
-                svc_val = str(pr[BASE_COL_SERVICE]).strip()
+                    key_no_svc = (mrf_, rf_, seg_, sub_)
+                    existing_no_svc = {(k[1], k[2], k[3], k[4]) for k in report_dict}
+                    if key_no_svc in existing_no_svc:
+                        for key_full, ridxs in report_dict.items():
+                            if (key_full[1], key_full[2], key_full[3], key_full[4]) == key_no_svc:
+                                for ridx in ridxs:
+                                    df_report.loc[ridx, target_col] = eff
+                                    matched_indices.append(ridx)
+                                    updated_count += 1
+                                    found_any = True
+                                break
+                    
+                    if not found_any:
+                        svc_val = list(svcs_check)[0] if svcs_check else ""
+                        new_row = _build_new_row(df_report, pr, svc_val, selected_date, target_col, eff, pct_lookup)
+                        df_report = pd.concat([df_report, pd.DataFrame([new_row])], ignore_index=True)
+                        added_indices.append(len(df_report) - 1)
+                        added_count += 1
             else:
-                svc_val = list(selected_services)[0] if selected_services else ""
-            new_row = _build_new_row(df_report, pr, svc_val, selected_date, target_col, eff, pct_lookup)
-            df_report = pd.concat([df_report, pd.DataFrame([new_row])], ignore_index=True)
-            added_indices.append(len(df_report) - 1)
-            added_count += 1
-    
-    total_eff = pivot['Эффект_тыс'].sum()
-    
-    return updated_count, added_count, matched_indices, added_indices, not_found_indices, total_eff, df_report
+                if BASE_COL_SERVICE in pr.index and pd.notna(pr[BASE_COL_SERVICE]):
+                    svc_val = str(pr[BASE_COL_SERVICE]).strip()
+                else:
+                    svc_val = list(selected_services)[0] if selected_services else ""
+                new_row = _build_new_row(df_report, pr, svc_val, selected_date, target_col, eff, pct_lookup)
+                df_report = pd.concat([df_report, pd.DataFrame([new_row])], ignore_index=True)
+                added_indices.append(len(df_report) - 1)
+                added_count += 1
+        
+        total_eff = pivot['Эффект_тыс'].sum()
+        print(f"Итог: updated={updated_count}, added={added_count}, eff={total_eff}")
+        
+        return updated_count, added_count, matched_indices, added_indices, not_found_indices, total_eff, df_report
+        
+    except Exception as e:
+        print(f"Ошибка в process_one_base: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 
 # ============================================================================
@@ -633,6 +667,7 @@ class LoadExcelWorker(QThread):
 class ProcessWorker(QThread):
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
+    progress = pyqtSignal(int)
     
     def __init__(self, df_base, df_amount, df_report, base_col, id_col, amount_col,
                  current_col, charges_mode, gcols, target_col, selected_filters):
@@ -642,9 +677,13 @@ class ProcessWorker(QThread):
     
     def run(self):
         try:
+            self.progress.emit(10)
             result = process_one_base(*self.args)
+            self.progress.emit(100)
             self.finished.emit(result)
         except Exception as e:
+            import traceback
+            traceback.print_exc()
             self.error.emit(str(e))
 
 
@@ -657,9 +696,9 @@ class SaveWorker(QThread):
         super().__init__()
         self.df_report = df_report
         self.target_col = target_col
-        self.matched = matched
-        self.added = added
-        self.not_found = not_found
+        self.matched = matched or []
+        self.added = added or []
+        self.not_found = not_found or []
         self.path = path
         self.month = month
     
@@ -668,39 +707,75 @@ class SaveWorker(QThread):
     
     def run(self):
         try:
+            print(f"=== SaveWorker started ===")
+            print(f"Path: {self.path}")
+            print(f"Target col: {self.target_col}")
+            print(f"DF shape: {self.df_report.shape}")
+            print(f"Matched: {len(self.matched)}, Added: {len(self.added)}, Not found: {len(self.not_found)}")
+            
             df_report = self.df_report
             target_col = self.target_col
-            matched = self.matched or []
-            added = self.added or []
-            not_found = self.not_found or []
+            matched = self.matched
+            added = self.added
+            not_found = self.not_found
             path = self.path
-            month = self.month
             
-            # Шаг 1. Запись DataFrame в файл через pandas
-            self._emit_progress(15)
+            # Шаг 1. Создаем директорию
+            self._emit_progress(5)
+            dir_name = os.path.dirname(os.path.abspath(path))
+            if dir_name:
+                os.makedirs(dir_name, exist_ok=True)
+                print(f"Directory created/checked: {dir_name}")
             
-            # Создаем директорию, если её нет
-            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+            # Шаг 2. Проверяем, существует ли целевая колонка
+            self._emit_progress(10)
+            if target_col not in df_report.columns:
+                error_msg = f"Целевая колонка '{target_col}' не найдена в DataFrame. Доступные колонки: {list(df_report.columns)}"
+                print(error_msg)
+                self.error.emit(error_msg)
+                return
             
-            with pd.ExcelWriter(path, engine='openpyxl', mode='w') as writer:
-                df_report.to_excel(writer, sheet_name=SHEET_TABLE3, index=False)
+            # Шаг 3. Запись DataFrame в файл через pandas
+            self._emit_progress(20)
+            try:
+                with pd.ExcelWriter(path, engine='openpyxl', mode='w') as writer:
+                    df_report.to_excel(writer, sheet_name=SHEET_TABLE3, index=False)
+                print(f"DataFrame записан в файл: {path}")
+            except Exception as e:
+                print(f"Ошибка записи DataFrame: {e}")
+                self.error.emit(f"Ошибка записи DataFrame: {e}")
+                return
             
-            # Шаг 2. Открытие файла и форматирование
-            self._emit_progress(30)
-            
-            wb = load_workbook(path)
-            ws = wb[SHEET_TABLE3]
+            # Шаг 4. Открытие файла и форматирование
+            self._emit_progress(40)
+            try:
+                wb = load_workbook(path)
+                ws = wb[SHEET_TABLE3]
+                print(f"Файл открыт, лист '{SHEET_TABLE3}', строк: {ws.max_row}")
+            except Exception as e:
+                print(f"Ошибка открытия файла: {e}")
+                self.error.emit(f"Ошибка открытия файла: {e}")
+                return
             
             grn = PatternFill(start_color=FILL_UPDATED, end_color=FILL_UPDATED, fill_type='solid')
             blue = PatternFill(start_color=FILL_ADDED, end_color=FILL_ADDED, fill_type='solid')
             yel = PatternFill(start_color=FILL_NOT_FOUND, end_color=FILL_NOT_FOUND, fill_type='solid')
             
             cols_list = list(df_report.columns)
+            print(f"Колонки в отчете: {cols_list}")
             
             def col_idx(name: str) -> Optional[int]:
                 return cols_list.index(name) + 1 if name in cols_list else None
             
             ci_target = col_idx(target_col)
+            print(f"Индекс целевой колонки '{target_col}': {ci_target}")
+            
+            if ci_target is None:
+                error_msg = f"Колонка '{target_col}' не найдена в списке колонок"
+                print(error_msg)
+                self.error.emit(error_msg)
+                return
+            
             ci_service = col_idx(RPT_COL_SERVICE)
             ci_date = col_idx(RPT_COL_DATE)
             ci_pct = col_idx(RPT_COL_PCT)
@@ -709,7 +784,6 @@ class SaveWorker(QThread):
             ci_seg = col_idx(RPT_COL_SEGMENT)
             ci_sub = col_idx(RPT_COL_SUBSEG)
             
-            # Исправленные форматы
             FMT_DATE = "dd.mm.yyyy"
             FMT_PCT = "0.00%"
             FMT_NUM3 = "#,##0.00"
@@ -717,9 +791,10 @@ class SaveWorker(QThread):
             
             max_row = ws.max_row
             max_col = len(cols_list)
+            print(f"Max row: {max_row}, Max col: {max_col}")
             
-            # Шаг 3. Применение числовых форматов
-            self._emit_progress(45)
+            # Шаг 5. Применение числовых форматов
+            self._emit_progress(55)
             
             fmt_cols: List[Tuple[Optional[int], str]] = [
                 (ci_service, FMT_TEXT),
@@ -735,13 +810,14 @@ class SaveWorker(QThread):
             for col_num, fmt in fmt_cols:
                 if col_num is None or max_row < 2:
                     continue
-                for row_num in range(2, max_row + 1):
-                    try:
+                try:
+                    for row_num in range(2, max_row + 1):
                         ws.cell(row=row_num, column=col_num).number_format = fmt
-                    except Exception as e:
-                        print(f"Ошибка применения формата к ячейке ({row_num}, {col_num}): {e}")
+                    print(f"Применен формат {fmt} к колонке {col_num}")
+                except Exception as e:
+                    print(f"Ошибка применения формата к колонке {col_num}: {e}")
             
-            # Шаг 4. Применение заливок
+            # Шаг 6. Применение заливок
             self._emit_progress(75)
             
             # Зелёная — обновлённые строки (только целевая колонка)
@@ -749,46 +825,53 @@ class SaveWorker(QThread):
                 for ridx in matched:
                     try:
                         row_num = ridx + 2
-                        if row_num <= max_row:
+                        if 2 <= row_num <= max_row:
                             ws.cell(row=row_num, column=ci_target).fill = grn
                     except Exception as e:
                         print(f"Ошибка применения зеленой заливки к строке {ridx}: {e}")
+                print(f"Применена зеленая заливка к {len(matched)} строкам")
             
             # Синяя — добавленные строки (все колонки)
             for ridx in added:
                 try:
                     row_num = ridx + 2
-                    if row_num <= max_row:
+                    if 2 <= row_num <= max_row:
                         for c in range(1, max_col + 1):
                             ws.cell(row=row_num, column=c).fill = blue
                 except Exception as e:
                     print(f"Ошибка применения синей заливки к строке {ridx}: {e}")
+            print(f"Применена синяя заливка к {len(added)} строкам")
             
             # Жёлтая — ненайденные в базе
             ci_mark = ci_target if ci_target else 1
             for ridx in not_found:
                 try:
                     row_num = ridx + 2
-                    if row_num <= max_row:
+                    if 2 <= row_num <= max_row:
                         ws.cell(row=row_num, column=ci_mark).fill = yel
                 except Exception as e:
                     print(f"Ошибка применения желтой заливки к строке {ridx}: {e}")
+            print(f"Применена желтая заливка к {len(not_found)} строкам")
             
-            # Шаг 5. Сохранение
+            # Шаг 7. Сохранение
             self._emit_progress(90)
             
             try:
+                print(f"Сохраняем файл: {path}")
                 wb.save(path)
                 print(f"Файл успешно сохранен: {path}")
             except Exception as e:
                 print(f"Ошибка сохранения файла: {e}")
-                raise
+                import traceback
+                traceback.print_exc()
+                self.error.emit(f"Ошибка сохранения файла: {e}")
+                return
             
             self._emit_progress(100)
             self.finished.emit((path, df_report))
             
         except Exception as e:
-            print(f"Ошибка в SaveWorker: {e}")
+            print(f"Критическая ошибка в SaveWorker: {e}")
             import traceback
             traceback.print_exc()
             self.error.emit(str(e))
@@ -1917,8 +2000,14 @@ class MainWindow(QMainWindow):
         )
         worker.finished.connect(self._on_calculation_done)
         worker.error.connect(self._on_calculation_error)
+        worker.progress.connect(self._on_process_progress)
         self._workers.append(worker)
         worker.start()
+    
+    def _on_process_progress(self, value):
+        page = self._page("process")
+        page.progress.setRange(0, 100)
+        page.progress.setValue(value)
     
     def _on_calculation_done(self, result):
         if result is None:
@@ -1967,6 +2056,12 @@ class MainWindow(QMainWindow):
         save_path = self._page("save").get_save_path()
         self.save_path = save_path
         
+        print(f"=== Начинаем сохранение ===")
+        print(f"Путь: {save_path}")
+        print(f"Целевая колонка: {self.target_col}")
+        print(f"DF shape: {self.df_report.shape}")
+        print(f"Колонки DF: {list(self.df_report.columns)}")
+        
         page = self._page("save")
         page.set_status("Сохранение файла...")
         page.progress.setRange(0, 100)
@@ -1975,6 +2070,15 @@ class MainWindow(QMainWindow):
         self.next_btn.setEnabled(False)
         self.back_btn.setEnabled(False)
         
+        # Проверяем, что target_col существует
+        if self.target_col not in self.df_report.columns:
+            QMessageBox.critical(self, "Ошибка", 
+                               f"Целевая колонка '{self.target_col}' не найдена в отчете.\n"
+                               f"Доступные колонки: {list(self.df_report.columns)}")
+            self.next_btn.setEnabled(True)
+            self.back_btn.setEnabled(True)
+            return
+        
         worker = SaveWorker(
             self.df_report, self.target_col,
             self.last_m_idx, self.last_a_idx, self.last_nf_idx,
@@ -1982,9 +2086,14 @@ class MainWindow(QMainWindow):
         )
         worker.finished.connect(self._on_save_done)
         worker.error.connect(self._on_save_error)
-        worker.progress.connect(page.progress.setValue)
+        worker.progress.connect(self._on_save_progress)
         self._workers.append(worker)
         worker.start()
+    
+    def _on_save_progress(self, value):
+        page = self._page("save")
+        page.progress.setValue(value)
+        print(f"Прогресс сохранения: {value}%")
     
     def _on_save_done(self, result):
         path, df = result
