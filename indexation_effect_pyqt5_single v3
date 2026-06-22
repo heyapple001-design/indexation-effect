@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 
 """
-Расчёт фактического эффекта от индексации.
 UI: единое окно-мастер на PyQt5 с индикатором прогресса.
+
 Поддерживает два режима расчёта:
 • external — начисления в отдельном файле (MSISDN + сумма за месяц)
 • inbase — начисления в той же базе (отдельная колонка с текущей суммой)
@@ -94,7 +94,7 @@ FILL_NOT_FOUND: str = "FFEB9C"
 # ============================================================================
 
 def unmap_rf(canon_value: Any) -> str:
-    key = " ".join(str(canon_value).replace("\xa0", " ").strip().lower().split())
+    key = " ".join(str(canon_value).replace("xa0", " ").strip().lower().split())
     return RF_REVERSE.get(key, str(canon_value))
 
 
@@ -133,14 +133,12 @@ def fmt_service(x: Any) -> Any:
 
 
 def fmt_seg(x: Any) -> Any:
-    """Нормализация сегмента/подсегмента.
-
+    """
+    Нормализация сегмента/подсегмента.
     Правила:
-      • слово с латиницей или цифрами  -> ВЕРХНИЙ регистр  (VPN, B2B, 3К, М2М ...)
-      • короткое (<=4) кириллическое слово -> ВЕРХНИЙ регистр (аббревиатура:
-        ДНК, РУ, МРФ, РФ, ШПД, КК ...)
-      • прочие кириллические слова     -> с заглавной буквы (Прочие, Бизнес ...)
-    Примеры:  'ДНК РУ' -> 'ДНК РУ',  'Прочие 3К' -> 'Прочие 3К',  'ШПД' -> 'ШПД'.
+    • слово с латиницей или цифрами -> ВЕРХНИЙ регистр (VPN, B2B, 3K, M2M ...)
+    • короткое (<=4) кириллическое слово -> ВЕРХНИЙ регистр (аббревиатура: ДНК, РУ, МРФ, РФ, ШПД, КК ...)
+    • прочие кириллические слова -> с заглавной буквы (Прочие, Бизнес ...)
     """
     if pd.isna(x) or str(x).strip() == "":
         return x
@@ -150,7 +148,7 @@ def fmt_seg(x: Any) -> Any:
         if re.search(r'[a-zA-Z0-9]', word):
             result.append(word.upper())
         else:
-            letters = re.sub(r'[^а-яёА-ЯЁ]', '', word)
+            letters = re.sub(r'[^a-zA-Zа-яА-Я]', '', word)
             if len(letters) <= 4:
                 result.append(word.upper())
             else:
@@ -194,7 +192,7 @@ def find_col_name(df: pd.DataFrame, name: str) -> Optional[str]:
 def norm_text(x: Any) -> str:
     if pd.isna(x):
         return ""
-    return "".join(str(x).replace("\xa0", "").strip().lower().split())
+    return "".join(str(x).replace("\\xa0", "").strip().lower().split())
 
 
 def norm_date(x: Any) -> str:
@@ -221,12 +219,9 @@ def map_rf(raw_value: Any) -> str:
     return norm_text(raw_str)
 
 
-RF_FULL_REVERSE: Dict[str, str] = {v.lower(): k for k, v in RF_REVERSE.items()}
-
-
 def canonical_rf_from_display(val: str) -> str:
     key = norm_text(val)
-    return RF_FULL_REVERSE.get(key, map_rf(val))
+    return RF_REVERSE.get(key, map_rf(val))
 
 
 # ============================================================================
@@ -240,9 +235,8 @@ def calc_pivot_external(df_base: pd.DataFrame, df_amount: pd.DataFrame,
     df_amount = df_amount.copy()
     df_base[base_col] = pd.to_numeric(df_base[base_col], errors='coerce')
     df_amount[amount_col] = pd.to_numeric(df_amount[amount_col], errors='coerce')
-    df_base[id_col] = df_base[id_col].astype(str).str.strip().str.replace('0', '', regex=False)
-    df_amount["MSISDN"] = df_amount["MSISDN"].astype(str).str.strip().str.replace('0', '', regex=False)
-
+    df_base[id_col] = df_base[id_col].astype(str).str.strip().str.replace('+7', '', regex=False)
+    df_amount["MSISDN"] = df_amount["MSISDN"].astype(str).str.strip().str.replace('+7', '', regex=False)
     merged = df_base.merge(df_amount[["MSISDN", amount_col]],
                            left_on=id_col, right_on="MSISDN", how='left')
     merged['Эффект_руб'] = merged[amount_col] - merged[base_col]
@@ -254,79 +248,32 @@ def calc_pivot_external(df_base: pd.DataFrame, df_amount: pd.DataFrame,
         agg_dict[c] = 'first'
 
     pivot = merged.groupby(group_cols, as_index=False).agg(agg_dict)
-    pivot['Эффект_тыс'] = (pivot['Эффект_руб'] / 1000).round(3)
     return pivot
 
 
 def calc_pivot_inbase(df_base: pd.DataFrame, base_col: str,
                       current_col: str, group_cols: List[str]) -> pd.DataFrame:
-    df = df_base.copy()
-    df[base_col] = pd.to_numeric(df[base_col], errors='coerce')
-    df[current_col] = pd.to_numeric(df[current_col], errors='coerce')
-    df['Эффект_руб'] = df[current_col] - df[base_col]
-    df.loc[df['Эффект_руб'] < 0, 'Эффект_руб'] = 0
+    df_base = df_base.copy()
+    df_base[base_col] = pd.to_numeric(df_base[base_col], errors='coerce')
+    df_base[current_col] = pd.to_numeric(df_base[current_col], errors='coerce')
+    df_base['Эффект_руб'] = df_base[current_col] - df_base[base_col]
+    df_base.loc[df_base['Эффект_руб'] < 0, 'Эффект_руб'] = 0
 
-    extra_cols = [c for c in [BASE_COL_PCT, BASE_COL_SEGMENT1] if c in df.columns]
+    extra_cols = [c for c in [BASE_COL_PCT, BASE_COL_SEGMENT1] if c in df_base.columns]
     agg_dict = {'Эффект_руб': 'sum'}
     for c in extra_cols:
         agg_dict[c] = 'first'
 
-    pivot = df.groupby(group_cols, as_index=False).agg(agg_dict)
-    pivot['Эффект_тыс'] = (pivot['Эффект_руб'] / 1000).round(3)
+    pivot = df_base.groupby(group_cols, as_index=False).agg(agg_dict)
     return pivot
 
 
-def _build_new_row(df_report: pd.DataFrame, pivot_row: pd.Series,
-                   svc_val: str, selected_date: str, target_col: str,
-                   eff_value: float, pct_lookup: Optional[dict] = None) -> dict:
-    new_row = {col: None for col in df_report.columns}
-
-    if RPT_COL_SERVICE in new_row:
-        new_row[RPT_COL_SERVICE] = fmt_service(svc_val)
-    if RPT_COL_DATE in new_row:
-        try:
-            new_row[RPT_COL_DATE] = pd.to_datetime(selected_date, dayfirst=True).date()
-        except (ValueError, TypeError, OverflowError):
-            new_row[RPT_COL_DATE] = selected_date
-    if RPT_COL_PCT in new_row:
-        pct_val = None
-        if pct_lookup:
-            mrf_key = norm_text(pivot_row[BASE_COL_MRF]) if BASE_COL_MRF in pivot_row.index else ""
-            rf_key = canonical_rf_from_display(pivot_row[BASE_COL_RF]) if BASE_COL_RF in pivot_row.index else ""
-            pct_val = pct_lookup.get((mrf_key, rf_key))
-        if pct_val is None and BASE_COL_PCT in pivot_row.index:
-            pct_val = fmt_pct(pivot_row[BASE_COL_PCT])
-        if pct_val is not None:
-            new_row[RPT_COL_PCT] = pct_val
-    if RPT_COL_MRF in new_row and BASE_COL_MRF in pivot_row.index:
-        new_row[RPT_COL_MRF] = fmt_mrf(pivot_row[BASE_COL_MRF])
-    if RPT_COL_RF in new_row and BASE_COL_RF in pivot_row.index:
-        new_row[RPT_COL_RF] = unmap_rf(canonical_rf_from_display(pivot_row[BASE_COL_RF]))
-    if RPT_COL_SEGMENT in new_row and BASE_COL_SEGMENT in pivot_row.index:
-        new_row[RPT_COL_SEGMENT] = fmt_seg(pivot_row[BASE_COL_SEGMENT])
-    if RPT_COL_SEGMENT1 in new_row and BASE_COL_SEGMENT1 in pivot_row.index:
-        new_row[RPT_COL_SEGMENT1] = fmt_seg(pivot_row[BASE_COL_SEGMENT1])
-    if RPT_COL_SUBSEG in new_row and BASE_COL_SUBSEG in pivot_row.index:
-        new_row[RPT_COL_SUBSEG] = fmt_seg(pivot_row[BASE_COL_SUBSEG])
-    if target_col in new_row:
-        new_row[target_col] = fmt_num3(eff_value)
-
-    return new_row
-
-
-def process_one_base(df_base: pd.DataFrame,
-                     df_amount: Optional[pd.DataFrame],
-                     df_report: pd.DataFrame,
-                     base_col: str,
-                     id_col: Optional[str],
-                     amount_col: str,
-                     current_col: Optional[str],
-                     charges_mode: str,
-                     available_group_cols: List[str],
-                     target_col: str,
-                     selected_filters: dict):
-
-    print(f"=== process_one_base started ===")
+def process_one_base(df_base: pd.DataFrame, df_amount: Optional[pd.DataFrame],
+                     df_report: pd.DataFrame, base_col: str, id_col: Optional[str],
+                     amount_col: str, current_col: Optional[str],
+                     charges_mode: str, available_group_cols: List[str],
+                     target_col: str, selected_filters: dict):
+    print(f"==== process_one_base started ===")
     print(f"target_col: {target_col}")
     print(f"available_group_cols: {available_group_cols}")
     print(f"charges_mode: {charges_mode}")
@@ -345,7 +292,8 @@ def process_one_base(df_base: pd.DataFrame,
     try:
         if charges_mode == MODE_EXTERNAL:
             print("Режим external")
-            pivot = calc_pivot_external(df_base, df_amount, base_col, id_col, amount_col, available_group_cols)
+            pivot = calc_pivot_external(df_base, df_amount, base_col, id_col,
+                                        amount_col, available_group_cols)
         else:
             print("Режим inbase")
             pivot = calc_pivot_inbase(df_base, base_col, current_col, available_group_cols)
@@ -397,7 +345,7 @@ def process_one_base(df_base: pd.DataFrame,
         filter_mrfs = set(selected_segments.get(RPT_COL_MRF, []))
         filter_rfs = set(selected_segments.get(RPT_COL_RF, []))
         filter_segments = set(selected_segments.get(RPT_COL_SEGMENT, []))
-        filter_subsegs = set(selected_segments.get(RPT_COL_SUBSEG, []))
+        filter_subseg = set(selected_segments.get(RPT_COL_SUBSEG, []))
 
         print(f"Фильтры: МРФ={filter_mrfs}, РФ={filter_rfs}")
 
@@ -425,7 +373,7 @@ def process_one_base(df_base: pd.DataFrame,
                     continue
                 if filter_segments and row_seg not in filter_segments:
                     continue
-                if filter_subsegs and row_sub not in filter_subsegs:
+                if filter_subseg and row_sub not in filter_subseg:
                     continue
 
                 key_no_svc = (row_mrf, row_rf, row_seg, row_sub)
@@ -444,81 +392,79 @@ def process_one_base(df_base: pd.DataFrame,
         matched_indices = []
         added_indices = []
 
-        svcs_check = selected_services if selected_services else {k[0] for k in report_dict}
-        if total_rpt == 0:
-            svcs_check = None
-
-        for _, pr in pivot.iterrows():
-            mrf_ = norm_text(pr[BASE_COL_MRF]) if BASE_COL_MRF in pr.index else ""
-            rf_ = canonical_rf_from_display(pr[BASE_COL_RF]) if BASE_COL_RF in pr.index else ""
-            seg_ = norm_text(pr[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in pr.index else ""
-            sub_ = norm_text(pr[BASE_COL_SUBSEG]) if BASE_COL_SUBSEG in pr.index else ""
-
-            # Проверка фильтров
-            ok = True
-            if filter_mrfs and mrf_ not in filter_mrfs:
-                ok = False
-            if ok and filter_rfs and rf_ not in filter_rfs:
-                ok = False
-            if ok and filter_segments and seg_ not in filter_segments:
-                ok = False
-            if ok and filter_subsegs and sub_ not in filter_subsegs:
-                ok = False
-
-            if not ok:
+        # Основной цикл сопоставления
+        for _, pivot_row in pivot.iterrows():
+            eff_value = pivot_row.get('Эффект_тыс', 0)
+            if eff_value == 0:
                 continue
 
-            eff = pr['Эффект_тыс']
+            service = fmt_service(pivot_row.get(BASE_COL_SERVICE, ""))
+            if selected_services and service not in selected_services:
+                continue
 
-            if total_rpt > 0:
-                sc_list = list(svcs_check) if svcs_check else [None]
-                found_any = False
+            mrf_val = fmt_mrf(pivot_row.get(BASE_COL_MRF, ""))
+            rf_val = unmap_rf(canonical_rf_from_display(pivot_row.get(BASE_COL_RF, "")))
+            seg_val = fmt_seg(pivot_row.get(BASE_COL_SEGMENT, ""))
+            sub_val = fmt_seg(pivot_row.get(BASE_COL_SUBSEG, ""))
 
-                for svc in sc_list:
-                    key = (svc, mrf_, rf_, seg_, sub_)
-                    if key in report_dict:
-                        for ridx in report_dict[key]:
-                            df_report.loc[ridx, target_col] = eff
-                            matched_indices.append(ridx)
-                            updated_count += 1
-                            found_any = True
+            # Поиск в отчете
+            found = False
+            for idx, r in df_report.iterrows():
+                r_svc = fmt_service(r[RPT_COL_SERVICE]) if RPT_COL_SERVICE in r.index else ""
+                r_mrf = fmt_mrf(r[RPT_COL_MRF]) if RPT_COL_MRF in r.index else ""
+                r_rf = unmap_rf(canonical_rf_from_display(r[RPT_COL_RF])) if RPT_COL_RF in r.index else ""
+                r_seg = fmt_seg(r[RPT_COL_SEGMENT]) if RPT_COL_SEGMENT in r.index else ""
+                r_sub = fmt_seg(r[RPT_COL_SUBSEG]) if RPT_COL_SUBSEG in r.index else ""
 
-                if not found_any:
-                    key_no_svc = (mrf_, rf_, seg_, sub_)
-                    existing_no_svc = {(k[1], k[2], k[3], k[4]) for k in report_dict}
-                    if key_no_svc in existing_no_svc:
-                        for key_full, ridxs in report_dict.items():
-                            if (key_full[1], key_full[2], key_full[3], key_full[4]) == key_no_svc:
-                                for ridx in ridxs:
-                                    df_report.loc[ridx, target_col] = eff
-                                    matched_indices.append(ridx)
-                                    updated_count += 1
-                                    found_any = True
-                                break
+                if (service == r_svc and mrf_val == r_mrf and
+                    rf_val == r_rf and seg_val == r_seg and sub_val == r_sub):
+                    # Обновляем существующую строку
+                    df_report.loc[idx, target_col] = fmt_num3(eff_value)
+                    matched_indices.append(idx)
+                    updated_count += 1
+                    found = True
+                    break
 
-                    if not found_any:
-                        svc_val = list(svcs_check)[0] if svcs_check else ""
-                        new_row = _build_new_row(df_report, pr, svc_val, selected_date, target_col, eff, pct_lookup)
-                        df_report = pd.concat([df_report, pd.DataFrame([new_row])], ignore_index=True)
-                        added_indices.append(len(df_report) - 1)
-                        added_count += 1
-            else:
-                if BASE_COL_SERVICE in pr.index and pd.notna(pr[BASE_COL_SERVICE]):
-                    svc_val = str(pr[BASE_COL_SERVICE]).strip()
-                else:
-                    svc_val = list(selected_services)[0] if selected_services else ""
-                new_row = _build_new_row(df_report, pr, svc_val, selected_date, target_col, eff, pct_lookup)
-                df_report = pd.concat([df_report, pd.DataFrame([new_row])], ignore_index=True)
-                added_indices.append(len(df_report) - 1)
+            if not found:
+                # Добавляем новую строку
+                new_row = {}
+                if RPT_COL_SERVICE in df_report.columns:
+                    new_row[RPT_COL_SERVICE] = service
+                if RPT_COL_DATE in df_report.columns:
+                    new_row[RPT_COL_DATE] = selected_date
+                if RPT_COL_PCT in df_report.columns:
+                    mrf_key = norm_text(mrf_val)
+                    rf_key = canonical_rf_from_display(rf_val)
+                    pct_val = pct_lookup.get((mrf_key, rf_key))
+                    if pct_val is None:
+                        pct_val = pivot_row.get(BASE_COL_PCT, None)
+                        if pct_val is not None:
+                            pct_val = fmt_pct(pct_val)
+                    new_row[RPT_COL_PCT] = pct_val if pct_val is not None else 0
+                if RPT_COL_MRF in df_report.columns:
+                    new_row[RPT_COL_MRF] = mrf_val
+                if RPT_COL_RF in df_report.columns:
+                    new_row[RPT_COL_RF] = rf_val
+                if RPT_COL_SEGMENT in df_report.columns:
+                    new_row[RPT_COL_SEGMENT] = seg_val
+                if RPT_COL_SEGMENT1 in df_report.columns:
+                    new_row[RPT_COL_SEGMENT1] = fmt_seg(pivot_row.get(BASE_COL_SEGMENT1, ""))
+                if RPT_COL_SUBSEG in df_report.columns:
+                    new_row[RPT_COL_SUBSEG] = sub_val
+                new_row[target_col] = fmt_num3(eff_value)
+
+                idx = len(df_report)
+                df_report.loc[idx] = new_row
+                added_indices.append(idx)
                 added_count += 1
 
         total_eff = pivot['Эффект_тыс'].sum()
-        print(f"Итог: updated={updated_count}, added={added_count}, eff={total_eff}")
+        print(f'Итог: updated={updated_count}, added={added_count}, eff={total_eff}')
 
         return updated_count, added_count, matched_indices, added_indices, not_found_indices, total_eff, df_report
 
     except Exception as e:
-        print(f"Ошибка в process_one_base: {e}")
+        print(f'Ошибка в process_one_base: {e}')
         import traceback
         traceback.print_exc()
         raise
@@ -556,9 +502,15 @@ QPushButton {
     padding: 8px 16px;
     min-width: 80px;
 }
-QPushButton:hover { background-color: #106EBE; }
-QPushButton:pressed { background-color: #005A9E; }
-QPushButton:disabled { background-color: #A8C7E3; }
+QPushButton:hover {
+    background-color: #106EBE;
+}
+QPushButton:pressed {
+    background-color: #005A9E;
+}
+QPushButton:disabled {
+    background-color: #A8C7E3;
+}
 QPushButton#secondaryButton {
     background-color: #F3F3F3;
     color: #1A1A1A;
@@ -572,7 +524,9 @@ QPushButton#dangerButton {
     background-color: #C42B1C;
     color: white;
 }
-QPushButton#dangerButton:hover { background-color: #A11E12; }
+QPushButton#dangerButton:hover {
+    background-color: #A11E12;
+}
 QLineEdit, QComboBox {
     border: 1px solid #D1D1D1;
     border-radius: 4px;
@@ -655,7 +609,7 @@ QFrame#cardSelected {
 
 
 # ============================================================================
-# Воркеры
+# Рабочие потоки
 # ============================================================================
 
 class LoadExcelWorker(QThread):
@@ -677,29 +631,6 @@ class LoadExcelWorker(QThread):
             self.error.emit(str(e))
 
 
-class ProcessWorker(QThread):
-    finished = pyqtSignal(object)
-    error = pyqtSignal(str)
-    progress = pyqtSignal(int)
-
-    def __init__(self, df_base, df_amount, df_report, base_col, id_col, amount_col,
-                 current_col, charges_mode, gcols, target_col, selected_filters):
-        super().__init__()
-        self.args = (df_base, df_amount, df_report, base_col, id_col, amount_col,
-                     current_col, charges_mode, gcols, target_col, selected_filters)
-
-    def run(self):
-        try:
-            self.progress.emit(10)
-            result = process_one_base(*self.args)
-            self.progress.emit(100)
-            self.finished.emit(result)
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.error.emit(str(e))
-
-
 class SaveWorker(QThread):
     finished = pyqtSignal(object)
     error = pyqtSignal(str)
@@ -714,12 +645,16 @@ class SaveWorker(QThread):
         self.not_found = not_found or []
         self.path = path
         self.month = month
+        self._save_in_progress = False
 
     def _emit_progress(self, value: int):
         self.progress.emit(max(0, min(100, value)))
 
     def _write_to(self, path: str) -> None:
-        """Записать DataFrame + форматирование в указанный путь. Бросает исключение при ошибке."""
+        """
+        Записать DataFrame + форматирование в указанный путь.
+        Бросает исключение при ошибке.
+        """
         df_report = self.df_report
         target_col = self.target_col
 
@@ -829,7 +764,13 @@ class SaveWorker(QThread):
 
     def run(self):
         try:
-            print(f"=== SaveWorker started ===")
+            # Проверка на повторный запуск
+            if self._save_in_progress:
+                print("Сохранение уже выполняется")
+                return
+            self._save_in_progress = True
+
+            print(f"== SaveWorker started ==")
             print(f"Path: {self.path}")
             print(f"Target col: {self.target_col}")
             print(f"DF shape: {self.df_report.shape}")
@@ -838,6 +779,13 @@ class SaveWorker(QThread):
             path = self.path
             if not path or not str(path).strip():
                 self.error.emit("Не задан путь для сохранения файла.")
+                self._save_in_progress = False
+                return
+
+            # Проверка, что DataFrame не пустой
+            if self.df_report.empty:
+                self.error.emit("DataFrame пуст, нечего сохранять")
+                self._save_in_progress = False
                 return
 
             self._emit_progress(10)
@@ -849,24 +797,29 @@ class SaveWorker(QThread):
                 self._write_to(path)
                 saved_path = path
                 print(f"Файл успешно сохранён: {path}")
+
             except PermissionError as e:
                 # Чаще всего — файл открыт в Excel / заблокирован.
-                fallback_reason = (f"Не удалось сохранить в выбранный путь\n  {path}\n"
-                                   f"Причина: файл, вероятно, открыт в Excel или заблокирован "
-                                   f"({e}).\nПробую сохранить на Рабочий стол...")
-                print(fallback_reason)
-            except OSError as e:
-                fallback_reason = (f"Ошибка записи в {path} ({e}).\n"
-                                   f"Пробую сохранить на Рабочий стол...")
+                fallback_reason = (
+                    f"Не удалось сохранить в выбранный путь\n{path}\n"
+                    f"Причина: файл, вероятно, открыт в Excel или заблокирован "
+                    f"({e}).\nПробую сохранить на Рабочий стол..."
+                )
                 print(fallback_reason)
 
-            # Резервная попытка — на Рабочий стол (гарантируем, что файл сохранится)
+            except OSError as e:
+                fallback_reason = (
+                    f"Ошибка записи в {path} ({e}).\n"
+                    f"Пробую сохранить на Рабочий стол..."
+                )
+                print(fallback_reason)
+
+            # Резервная попытка — на Рабочий стол
             if saved_path is None:
                 desktop = os.path.expanduser("~/Desktop") or os.path.expanduser("~")
                 base_name = os.path.basename(path) if path else "отчёт.xlsx"
                 if not base_name.lower().endswith(".xlsx"):
                     base_name += ".xlsx"
-                # добавим метку времени, чтобы не затереть существующий файл
                 ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                 stem, ext = os.path.splitext(base_name)
                 fb_path = os.path.join(desktop, f"{stem}_{ts}{ext}")
@@ -880,21 +833,60 @@ class SaveWorker(QThread):
                     traceback.print_exc()
                     msg = fallback_reason + f"\n\nРезервное сохранение тоже не удалось:\n{e2}"
                     self.error.emit(msg)
+                    self._save_in_progress = False
                     return
 
             self._emit_progress(100)
             final_path = os.path.abspath(saved_path)
             self.finished.emit((final_path, self.df_report, fallback_reason))
+            self._save_in_progress = False
 
         except Exception as e:
             print(f"Критическая ошибка в SaveWorker: {e}")
             import traceback
             traceback.print_exc()
             self.error.emit(str(e))
+            self._save_in_progress = False
+
+
+class ProcessWorker(QThread):
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(int)
+
+    def __init__(self, df_base, df_amount, df_report, base_col, id_col,
+                 amount_col, current_col, charges_mode, group_cols,
+                 target_col, selected_filters):
+        super().__init__()
+        self.df_base = df_base
+        self.df_amount = df_amount
+        self.df_report = df_report
+        self.base_col = base_col
+        self.id_col = id_col
+        self.amount_col = amount_col
+        self.current_col = current_col
+        self.charges_mode = charges_mode
+        self.group_cols = group_cols
+        self.target_col = target_col
+        self.selected_filters = selected_filters
+
+    def run(self):
+        try:
+            self.progress.emit(10)
+            result = process_one_base(
+                self.df_base, self.df_amount, self.df_report,
+                self.base_col, self.id_col, self.amount_col,
+                self.current_col, self.charges_mode, self.group_cols,
+                self.target_col, self.selected_filters
+            )
+            self.progress.emit(100)
+            self.finished.emit(result)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 # ============================================================================
-# Страницы мастера
+# Страницы интерфейса
 # ============================================================================
 
 class BasePage(QWidget):
@@ -935,18 +927,17 @@ class StartPage(BasePage):
         gl = QVBoxLayout(g_month)
         self.combo_month = QComboBox()
         self.combo_month.addItems(self.months)
-        self.combo_month.setCurrentText("апрель")
+        self.combo_month.setCurrentText("январь")
         gl.addWidget(self.combo_month)
         self._layout.addWidget(g_month)
 
         g_mrf = QGroupBox("МРФ")
         gl = QVBoxLayout(g_mrf)
-
         btn_row = QHBoxLayout()
-        btn_all = QPushButton("√ Все")
+        btn_all = QPushButton("✓ Все")
         btn_all.setObjectName("secondaryButton")
         btn_all.clicked.connect(self._select_all)
-        btn_none = QPushButton("X Снять")
+        btn_none = QPushButton("✕ Снять")
         btn_none.setObjectName("secondaryButton")
         btn_none.clicked.connect(self._deselect_all)
         btn_row.addWidget(btn_all)
@@ -973,7 +964,7 @@ class StartPage(BasePage):
             self.mrf_vars[mrf] = cb
             card_l.addWidget(cb)
             if rf_list:
-                rf_lbl = QLabel(" " + " . ".join(rf_list))
+                rf_lbl = QLabel(" + ".join(rf_list))
                 rf_lbl.setObjectName("hint")
                 card_l.addWidget(rf_lbl)
             cl.addWidget(card)
@@ -1105,7 +1096,6 @@ class BaseSetupPage(BasePage):
         # Колонки
         g_cols = QGroupBox("Колонки")
         gl = QVBoxLayout(g_cols)
-
         row1 = QHBoxLayout()
         row1.addWidget(QLabel("Начисление ДО индексации:"))
         self.combo_base_col = QComboBox()
@@ -1181,7 +1171,7 @@ class BaseSetupPage(BasePage):
                     break
 
             possible_ids = ["MSISDN", "Уникальный идентификационный номер услуги (ШПД, VPN - логин порта)",
-                            "Уникальный идентификационный номер услуги", "MSISDN/Логин"]
+                           "Уникальный идентификационный номер услуги", "MSISDN/Логин"]
             id_col = next((c for c in possible_ids if c in cols), None)
             if id_col:
                 self.combo_id_col.setCurrentText(id_col)
@@ -1317,7 +1307,8 @@ class FilterPage(BasePage):
                 mrf_rf_canonical.add(norm_text(map_rf(rf_raw)))
         mrf_norm = norm_text(mrf_name)
 
-        cols = [c for c in [RPT_COL_SERVICE, RPT_COL_MRF, RPT_COL_RF, RPT_COL_SEGMENT, RPT_COL_SUBSEG]
+        cols = [c for c in [RPT_COL_SERVICE, RPT_COL_MRF, RPT_COL_RF,
+                            RPT_COL_SEGMENT, RPT_COL_SUBSEG]
                 if c in df_report.columns]
 
         for col in cols:
@@ -1325,7 +1316,7 @@ class FilterPage(BasePage):
             is_service = (dn == "Услуга")
             group = QGroupBox(f"{'★ ' if is_service else ''}{dn}{' — обязательно!' if is_service else ''}")
             if is_service:
-                group.setStyleSheet("QGroupBox { color: #C42B1C; font-weight: bold; }")
+                group.setStyleSheet("QGroupBox{color:#C42B1C;font-weight:bold;}")
 
             gl = QVBoxLayout(group)
             gl.setSpacing(4)
@@ -1341,11 +1332,11 @@ class FilterPage(BasePage):
                 gl.addWidget(hint)
 
             btn_row = QHBoxLayout()
-            btn_all = QPushButton("√ Все")
+            btn_all = QPushButton("✓ Все")
             btn_all.setObjectName("secondaryButton")
             btn_all.setFixedWidth(60)
             btn_all.clicked.connect(lambda checked, c=col: self._select_all(c))
-            btn_none = QPushButton("× Снять")
+            btn_none = QPushButton("✕ Снять")
             btn_none.setObjectName("secondaryButton")
             btn_none.setFixedWidth(60)
             btn_none.clicked.connect(lambda checked, c=col: self._deselect_all(c))
@@ -1363,7 +1354,6 @@ class FilterPage(BasePage):
             vgl.setContentsMargins(2, 2, 2, 2)
             max_c = 4
             rows = (len(values) + max_c - 1) // max_c if max_c else 1
-
             for idx, val in enumerate(values):
                 r, cn = idx % rows, idx // rows
                 default = self._auto_check(col, val, mrf_rf_canonical, mrf_norm)
@@ -1382,7 +1372,6 @@ class FilterPage(BasePage):
                 gl.addWidget(inner)
             else:
                 gl.addWidget(widget)
-
             self.cl.addWidget(group)
 
         if self.cl.count() < 6:
@@ -1401,9 +1390,6 @@ class FilterPage(BasePage):
         elif col == RPT_COL_SERVICE:
             return sorted(dict.fromkeys(fmt_service(str(v).strip()) for v in s if str(v).strip()))
         elif col in (RPT_COL_SEGMENT, RPT_COL_SUBSEG):
-            # ИСПРАВЛЕНО: раньше сюда попадал norm_text() — он удалял пробелы и делал
-            # весь текст строчным, из-за чего «ДНК РУ» превращался в «днкру».
-            # Теперь нормализуем регистр через fmt_seg(), не ломая пробелы.
             return sorted(dict.fromkeys(fmt_seg(str(v).strip()) for v in s if str(v).strip()))
         else:
             vals = [norm_text(v) for v in s]
@@ -1436,19 +1422,10 @@ class FilterPage(BasePage):
     def get_data(self) -> dict:
         selected = {}
         for c in self._checkbox_vars:
-            vals = [val for val, cb in self._checkbox_vars[c].items() if cb.isChecked()]
-            if c == RPT_COL_MRF:
-                vals = [norm_text(v) for v in vals]
-            elif c == RPT_COL_RF:
-                vals = [canonical_rf_from_display(v) for v in vals]
-            elif c == RPT_COL_SERVICE:
-                vals = [norm_text(v) for v in vals]
-            elif c in (RPT_COL_SEGMENT, RPT_COL_SUBSEG):
-                vals = [norm_text(v) for v in vals]
-            selected[c] = vals
+            selected[c] = [val for val, cb in self._checkbox_vars[c].items() if cb.isChecked()]
         return {
             "date": self.date_combo.currentText(),
-            "selected": {k: v for k, v in selected.items() if v}
+            "selected": selected
         }
 
 
@@ -1458,17 +1435,19 @@ class ProgressPage(BasePage):
         self._build()
 
     def _build(self):
-        self.title_lbl = QLabel("Шаг 5. Обработка")
+        self.title_lbl = QLabel("Шаг 5. Расчёт эффекта")
         self.title_lbl.setObjectName("subheader")
         self._layout.addWidget(self.title_lbl)
-        self.add_hint("Идёт расчёт эффекта и сопоставление с отчётом. Пожалуйста, подождите.")
+
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
         self.progress.setTextVisible(True)
         self._layout.addWidget(self.progress)
+
         self.status_lbl = QLabel("")
         self.status_lbl.setObjectName("hint")
         self._layout.addWidget(self.status_lbl)
+
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumHeight(200)
@@ -1491,23 +1470,19 @@ class ProgressPage(BasePage):
 class SavePage(BasePage):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._build()
         self._save_path = ""
         self._current_path = ""
         self._month = ""
         self._mrf_name = ""
         self._date = ""
-        # Режим сохранения: "common" — накапливать все базы в один файл,
-        #                  "separate" — отдельный файл для каждой базы.
         self._mode = "common"
-        self._common_path = ""        # зафиксированный общий путь (режим common)
-        self._common_month = ""       # месяц, для которого сформирован общий путь
+        self._common_path = ""
+        self._common_month = ""
+        self._build()
 
     def _build(self):
         self.add_header("Шаг 6. Сохранение")
-        self.add_hint(
-            "Выберите способ сохранения результата расчёта."
-        )
+        self.add_hint("Выберите способ сохранения результата расчёта.")
 
         # Режим сохранения
         g_mode = QGroupBox("Куда сохранять")
@@ -1528,7 +1503,7 @@ class SavePage(BasePage):
         self._layout.addWidget(g_mode)
 
         self.name_lbl = QLabel("")
-        self.name_lbl.setObjectName("filenameLabel")
+        self.name_lbl.setObjectName("hint")
         self.name_lbl.setWordWrap(True)
         self._layout.addWidget(self.name_lbl)
 
@@ -1584,8 +1559,7 @@ class SavePage(BasePage):
         dir_name = self._dir_name()
 
         if self._mode == "common":
-            # Стабильное имя (без МРФ/даты), чтобы все базы шли в один файл.
-            # Перегенерируем, если сменился месяц.
+            # Используем сохраненный путь или генерируем новый
             if not self._common_path or self._common_month != self._month:
                 month_slug = self._slugify(self._month) if self._month else ""
                 base = (f"{month_slug}_" if month_slug else "") + "эффект_индексации_все_базы"
@@ -1593,10 +1567,9 @@ class SavePage(BasePage):
                 self._common_path = os.path.join(dir_name, new_name)
                 self._common_month = self._month
             self._save_path = self._common_path
-            name = os.path.basename(self._common_path)
-            self.edit.setText(name)
+            self.edit.setText(os.path.basename(self._save_path))
             self.edit.setToolTip(self._save_path)
-            self.name_lbl.setText(f"Общий файл (накапливается): {name}")
+            self.name_lbl.setText(f"Общий файл (накапливается): {os.path.basename(self._save_path)}")
             return self._save_path
 
         # separate — уникальное имя для каждой базы
@@ -1721,57 +1694,72 @@ class MainWindow(QMainWindow):
 
         self.central = QWidget()
         self.setCentralWidget(self.central)
-        layout = QVBoxLayout(self.central)
-        layout.setSpacing(0)
-        layout.setContentsMargins(0, 0, 0, 0)
+        self.layout = QVBoxLayout(self.central)
+        self.layout.setSpacing(0)
+        self.layout.setContentsMargins(0, 0, 0, 0)
 
+        # Шапка
         header = QLabel("Расчёт фактического эффекта от индексации")
         header.setObjectName("header")
-        layout.addWidget(header)
+        header.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(header)
 
-        info_panel = QWidget()
-        info_panel.setStyleSheet("background-color: #F3F3F3;")
-        info_l = QHBoxLayout(info_panel)
-        info_l.setContentsMargins(16, 8, 16, 8)
-        self.step_lbl = QLabel("Шаг: Параметры")
-        self.mrf_lbl = QLabel("МРФ: —")
-        self.base_lbl = QLabel("База: —")
-        info_l.addWidget(self.step_lbl)
-        info_l.addStretch()
-        info_l.addWidget(self.mrf_lbl)
-        info_l.addWidget(self.base_lbl)
-        layout.addWidget(info_panel)
-
-        self.stack = QStackedWidget()
-        layout.addWidget(self.stack, 1)
-
+        # Прогресс-бар шагов
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.progress.setTextVisible(True)
-        layout.addWidget(self.progress)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(4)
+        self.progress.setStyleSheet("QProgressBar { border: none; }")
+        self.layout.addWidget(self.progress)
 
-        self.status_lbl = QLabel("Готов к работе")
+        # Статусная строка
+        info_bar = QHBoxLayout()
+        self.step_lbl = QLabel("Шаг: —")
+        self.step_lbl.setObjectName("hint")
+        self.mrf_lbl = QLabel("МРФ: —")
+        self.mrf_lbl.setObjectName("hint")
+        self.base_lbl = QLabel("База: —")
+        self.base_lbl.setObjectName("hint")
+        info_bar.addWidget(self.step_lbl)
+        info_bar.addStretch()
+        info_bar.addWidget(self.mrf_lbl)
+        info_bar.addWidget(QLabel("|"))
+        info_bar.addWidget(self.base_lbl)
+        info_widget = QWidget()
+        info_widget.setContentsMargins(16, 4, 16, 4)
+        info_widget.setLayout(info_bar)
+        self.layout.addWidget(info_widget)
+
+        # Стек страниц
+        self.stack = QStackedWidget()
+        self.layout.addWidget(self.stack, 1)
+
+        # Кнопки навигации
+        self.status_lbl = QLabel("")
         self.status_lbl.setObjectName("hint")
         self.status_lbl.setContentsMargins(16, 4, 16, 4)
-        layout.addWidget(self.status_lbl)
+        self.layout.addWidget(self.status_lbl)
 
         btn_panel = QWidget()
         btn_l = QHBoxLayout(btn_panel)
         btn_l.setContentsMargins(16, 12, 16, 12)
         btn_l.addStretch()
+
         self.back_btn = QPushButton("← Назад")
         self.back_btn.setObjectName("secondaryButton")
         self.back_btn.clicked.connect(self.on_back)
         btn_l.addWidget(self.back_btn)
+
         self.next_btn = QPushButton("Далее →")
         self.next_btn.clicked.connect(self.on_next)
         btn_l.addWidget(self.next_btn)
+
         self.cancel_btn = QPushButton("Отмена")
         self.cancel_btn.setObjectName("dangerButton")
         self.cancel_btn.clicked.connect(self.close)
         btn_l.addWidget(self.cancel_btn)
-        layout.addWidget(btn_panel)
+
+        self.layout.addWidget(btn_panel)
 
         # Страницы
         self.pages = {}
@@ -1804,6 +1792,8 @@ class MainWindow(QMainWindow):
         self.selected_date = ""
         self._workers: List[QThread] = []
         self.save_path = ""
+        self._save_in_progress = False  # Флаг для предотвращения повторного сохранения
+
         self._update_ui()
 
     def _add_page(self, name: str, page: QWidget):
@@ -1856,8 +1846,7 @@ class MainWindow(QMainWindow):
         else:
             self.next_btn.setVisible(True)
             self.back_btn.setVisible(True)
-
-        self.next_btn.setText("Далее →")
+            self.next_btn.setText("Далее →")
 
     def set_status(self, text: str):
         self.status_lbl.setText(text)
@@ -1921,7 +1910,7 @@ class MainWindow(QMainWindow):
         if self.state != state:
             self.history.append(self.state)
             self.state = state
-        self._update_ui()
+            self._update_ui()
 
     def _load_report(self):
         page = self._page("report")
@@ -2049,16 +2038,18 @@ class MainWindow(QMainWindow):
         self.back_btn.setEnabled(True)
 
     def _after_charges_loaded(self):
-        gcols = [c for c in [BASE_COL_MRF, BASE_COL_RF, BASE_COL_SEGMENT, BASE_COL_SUBSEG, BASE_COL_SEGMENT1]
+        gcols = [c for c in [BASE_COL_MRF, BASE_COL_RF, BASE_COL_SEGMENT,
+                             BASE_COL_SUBSEG, BASE_COL_SEGMENT1]
                  if c in self.df_base.columns]
+
         if not gcols:
             QMessageBox.critical(self, "Ошибка",
                                  "В базе нет колонок группировки (МРФ, РФ, Сегмент, Подсегмент)")
             self.next_btn.setEnabled(True)
             self.back_btn.setEnabled(True)
             return
-        self.gcols = gcols
 
+        self.gcols = gcols
         self._page("filter").reset(self.df_report, self.chosen_mrf[self.current_mrf_idx])
         self._go_to("filter")
         self.next_btn.setEnabled(True)
@@ -2136,6 +2127,11 @@ class MainWindow(QMainWindow):
         self._go_to("filter")
 
     def _run_save(self):
+        # Проверка на уже запущенный процесс сохранения
+        if self._save_in_progress:
+            print("Сохранение уже выполняется")
+            return
+
         save_path = self._page("save").get_save_path()
         self.save_path = save_path
 
@@ -2149,6 +2145,7 @@ class MainWindow(QMainWindow):
         page.set_status("Сохранение файла...")
         page.progress.setRange(0, 100)
         page.progress.setValue(0)
+
         self.set_status("Сохранение файла...")
         self.next_btn.setEnabled(False)
         self.back_btn.setEnabled(False)
@@ -2156,11 +2153,21 @@ class MainWindow(QMainWindow):
         # Проверяем, что target_col существует
         if self.target_col not in self.df_report.columns:
             QMessageBox.critical(self, "Ошибка",
-                               f"Целевая колонка '{self.target_col}' не найдена в отчете.\n"
-                               f"Доступные колонки: {list(self.df_report.columns)}")
+                                 f"Целевая колонка '{self.target_col}' не найдена в отчете.\n"
+                                 f"Доступные колонки: {list(self.df_report.columns)}")
             self.next_btn.setEnabled(True)
             self.back_btn.setEnabled(True)
             return
+
+        # Проверка, что DataFrame не пустой
+        if self.df_report.empty:
+            QMessageBox.critical(self, "Ошибка",
+                                 "DataFrame пуст, нечего сохранять")
+            self.next_btn.setEnabled(True)
+            self.back_btn.setEnabled(True)
+            return
+
+        self._save_in_progress = True
 
         worker = SaveWorker(
             self.df_report, self.target_col,
@@ -2174,23 +2181,27 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def _on_save_progress(self, value):
+        print(f"Прогресс сохранения: {value}%")
         page = self._page("save")
         page.progress.setValue(value)
-        print(f"Прогресс сохранения: {value}%")
+        # Принудительно обновляем UI
+        QApplication.processEvents()
 
     def _on_save_done(self, result):
+        self._save_in_progress = False
         path, df, fallback_reason = result
+
         # В режиме «общий файл» сохраняем именно в общий путь,
         # чтобы следующие базы накапливались в него.
         if self._page("save").get_mode() == "common":
             self.table3_path = path
-        self.df_report = df
+            self.df_report = df
 
         page = self._page("save")
         page.progress.setValue(100)
         status = f"✓ Сохранено: {path}"
         if fallback_reason:
-            status += f"\n⚠ {fallback_reason}"
+            status += f"\n△ {fallback_reason}"
         page.set_status(status)
         self.set_status(f"Сохранено: {os.path.basename(path)}")
 
@@ -2211,7 +2222,6 @@ class MainWindow(QMainWindow):
         self.back_btn.setEnabled(True)
 
         mode_str = "внешние начисления" if self.base_data["mode"] == MODE_EXTERNAL else "начисления из базы"
-
         summary = (
             f"База #{self.current_base_num} ({os.path.basename(self.base_data['base_path'])})\n"
             f"Режим: {mode_str}\n"
@@ -2231,7 +2241,9 @@ class MainWindow(QMainWindow):
         self._go_to("summary")
 
     def _on_save_error(self, error):
-        QMessageBox.critical(self, "Ошибка сохранения", f"Не удалось сохранить файл:\n{error}")
+        self._save_in_progress = False
+        QMessageBox.critical(self, "Ошибка сохранения",
+                             f"Не удалось сохранить файл:\n{error}")
         self.set_status("Ошибка сохранения")
         page = self._page("save")
         page.progress.setRange(0, 100)
@@ -2265,6 +2277,7 @@ class MainWindow(QMainWindow):
         self._update_ui()
 
     def closeEvent(self, event):
+        # Останавливаем все рабочие потоки
         for w in self._workers:
             if w.isRunning():
                 w.terminate()
@@ -2297,4 +2310,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
