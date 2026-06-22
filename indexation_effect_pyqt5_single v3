@@ -19,6 +19,7 @@ import pathlib
 from datetime import datetime
 from collections import defaultdict
 from typing import Any, Optional, List, Dict, Tuple, Set
+import traceback
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -30,7 +31,7 @@ from PyQt5.QtWidgets import (
     QStackedWidget, QScrollArea, QGroupBox, QTextEdit, QSizePolicy,
     QSpacerItem, QPlainTextEdit, QSplitter
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer, QMutex, QMutexLocker
 from PyQt5.QtGui import QFont, QIcon
 
 
@@ -645,7 +646,8 @@ class SaveWorker(QThread):
         self.not_found = not_found or []
         self.path = path
         self.month = month
-        self._save_in_progress = False
+        self._is_running = False
+        self._mutex = QMutex()
 
     def _emit_progress(self, value: int):
         self.progress.emit(max(0, min(100, value)))
@@ -763,13 +765,13 @@ class SaveWorker(QThread):
             raise IOError(f"Файл создан пустым: {path}")
 
     def run(self):
-        try:
-            # Проверка на повторный запуск
-            if self._save_in_progress:
+        with QMutexLocker(self._mutex):
+            if self._is_running:
                 print("Сохранение уже выполняется")
                 return
-            self._save_in_progress = True
+            self._is_running = True
 
+        try:
             print(f"== SaveWorker started ==")
             print(f"Path: {self.path}")
             print(f"Target col: {self.target_col}")
@@ -779,13 +781,11 @@ class SaveWorker(QThread):
             path = self.path
             if not path or not str(path).strip():
                 self.error.emit("Не задан путь для сохранения файла.")
-                self._save_in_progress = False
                 return
 
             # Проверка, что DataFrame не пустой
             if self.df_report.empty:
                 self.error.emit("DataFrame пуст, нечего сохранять")
-                self._save_in_progress = False
                 return
 
             self._emit_progress(10)
@@ -814,6 +814,14 @@ class SaveWorker(QThread):
                 )
                 print(fallback_reason)
 
+            except Exception as e:
+                fallback_reason = (
+                    f"Неизвестная ошибка при сохранении в {path}:\n{e}\n"
+                    f"Пробую сохранить на Рабочий стол..."
+                )
+                print(fallback_reason)
+                traceback.print_exc()
+
             # Резервная попытка — на Рабочий стол
             if saved_path is None:
                 desktop = os.path.expanduser("~/Desktop") or os.path.expanduser("~")
@@ -833,20 +841,21 @@ class SaveWorker(QThread):
                     traceback.print_exc()
                     msg = fallback_reason + f"\n\nРезервное сохранение тоже не удалось:\n{e2}"
                     self.error.emit(msg)
-                    self._save_in_progress = False
+                    with QMutexLocker(self._mutex):
+                        self._is_running = False
                     return
 
             self._emit_progress(100)
             final_path = os.path.abspath(saved_path)
             self.finished.emit((final_path, self.df_report, fallback_reason))
-            self._save_in_progress = False
 
         except Exception as e:
             print(f"Критическая ошибка в SaveWorker: {e}")
-            import traceback
             traceback.print_exc()
             self.error.emit(str(e))
-            self._save_in_progress = False
+        finally:
+            with QMutexLocker(self._mutex):
+                self._is_running = False
 
 
 class ProcessWorker(QThread):
@@ -1478,6 +1487,7 @@ class SavePage(BasePage):
         self._mode = "common"
         self._common_path = ""
         self._common_month = ""
+        self._filename_generated = False  # Флаг для предотвращения повторной генерации
         self._build()
 
     def _build(self):
@@ -1540,6 +1550,8 @@ class SavePage(BasePage):
             self.mode_hint.setText(
                 "Для каждой базы создаётся отдельный файл (имя включает МРФ и дату)."
             )
+        # Сбрасываем флаг, чтобы перегенерировать имя при смене режима
+        self._filename_generated = False
         self._generate_filename()
 
     def _slugify(self, s: str) -> str:
@@ -1556,6 +1568,10 @@ class SavePage(BasePage):
         return os.path.expanduser("~/Desktop")
 
     def _generate_filename(self) -> str:
+        # Предотвращаем повторную генерацию, если уже сгенерировали и параметры не изменились
+        if self._filename_generated and self._save_path:
+            return self._save_path
+
         dir_name = self._dir_name()
 
         if self._mode == "common":
@@ -1570,6 +1586,7 @@ class SavePage(BasePage):
             self.edit.setText(os.path.basename(self._save_path))
             self.edit.setToolTip(self._save_path)
             self.name_lbl.setText(f"Общий файл (накапливается): {os.path.basename(self._save_path)}")
+            self._filename_generated = True
             return self._save_path
 
         # separate — уникальное имя для каждой базы
@@ -1588,6 +1605,7 @@ class SavePage(BasePage):
         self.edit.setText(new_name)
         self.edit.setToolTip(self._save_path)
         self.name_lbl.setText(f'Имя файла (сгенерировано): {new_name}')
+        self._filename_generated = True
         return self._save_path
 
     def _browse(self):
@@ -1614,6 +1632,7 @@ class SavePage(BasePage):
         self._month = month
         self._mrf_name = mrf_name
         self._date = date
+        self._filename_generated = False  # Сбрасываем флаг, чтобы сгенерировать новое имя
         self._generate_filename()
         self.status_lbl.setText("")
         self.progress.setRange(0, 100)
@@ -1869,6 +1888,7 @@ class MainWindow(QMainWindow):
             save_page = self._page("save")
             save_page._common_path = ""
             save_page._common_month = ""
+            save_page._filename_generated = False
             self._go_to("report")
 
         elif self.state == "report":
@@ -2082,6 +2102,7 @@ class MainWindow(QMainWindow):
         page = self._page("process")
         page.progress.setRange(0, 100)
         page.progress.setValue(value)
+        QApplication.processEvents()
 
     def _on_calculation_done(self, result):
         if result is None:
