@@ -1,0 +1,909 @@
+import pandas as pd
+import numpy as np
+import os
+import pickle
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+from datetime import datetime
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+
+RF_MAPPING = {
+    'Екатеринбургский филиал': 'Екатеринбургский филиал',
+    'Пермский филиал': 'Пермский филиал',
+    'Челябинский филиал': 'Челябинский филиал',
+    'Тюменский филиал': 'Филиал в Тюменской и Курганской областях',
+    'Филиал в Тюменской и Курганской областях': 'Филиал в Тюменской и Курганской областях',
+    'Ханты-Мансийский филиал': 'Ханты-Мансийский филиал',
+    'Ямало-Ненецкий филиал': 'Ямало-Ненецкий филиал',
+    'Курганский филиал': 'Курганский филиал',
+    'фэс екатеринбургский': 'Екатеринбургский филиал',
+    'екатеринбургский': 'Екатеринбургский филиал',
+    'фэс пермский': 'Пермский филиал',
+    'пермский': 'Пермский филиал',
+    'фэс тюменский': 'Филиал в Тюменской и Курганской областях',
+    'тюменский и курганский': 'Филиал в Тюменской и Курганской областях',
+    'тюменский': 'Филиал в Тюменской и Курганской областях',
+    'фэс челябинский': 'Челябинский филиал',
+    'челябинский': 'Челябинский филиал',
+    'фэс ханты-мансийский': 'Ханты-Мансийский филиал',
+    'ханты-мансийский': 'Ханты-Мансийский филиал',
+    'фэс ямало-ненецкий': 'Ямало-Ненецкий филиал',
+    'ямало-ненецкий': 'Ямало-Ненецкий филиал',
+    'фэс курганский': 'Курганский филиал',
+    'курганский': 'Курганский филиал',
+}
+
+def setup_styles():
+    style = ttk.Style()
+    available_themes = style.theme_names()
+    for theme in ['vista', 'clam', 'alt', 'default']:
+        if theme in available_themes:
+            style.theme_use(theme)
+            break
+    style.configure('Title.TLabel', font=('Segoe UI', 12, 'bold'))
+    style.configure('Instruction.TLabel', font=('Segoe UI', 10))
+    style.configure('Modern.TButton', font=('Segoe UI', 10), padding=6)
+    style.configure('TLabel', font=('Segoe UI', 9))
+    style.configure('TButton', font=('Segoe UI', 9))
+    style.configure('TCombobox', font=('Segoe UI', 10))
+
+def norm_text(x):
+    if pd.isna(x):
+        return ""
+    return " ".join(str(x).replace("\xa0", " ").strip().lower().split())
+
+def norm_date(x):
+    if pd.isna(x):
+        return ""
+    dt = pd.to_datetime(x, errors="coerce", dayfirst=True)
+    if pd.isna(dt):
+        return norm_text(x)
+    return dt.strftime("%Y-%m-%d")
+
+def select_file(title):
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    filename = filedialog.askopenfilename(
+        title=title,
+        filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+        initialdir=os.path.expanduser("~/Desktop")
+    )
+    root.destroy()
+    return filename
+
+def select_save_file(title, initialfile):
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    filename = filedialog.asksaveasfilename(
+        title=title,
+        initialfile=initialfile,
+        defaultextension=".xlsx",
+        filetypes=[("Excel files", "*.xlsx")],
+        initialdir=os.path.expanduser("~/Desktop")
+    )
+    root.destroy()
+    return filename
+
+def select_month():
+    months = ["январь", "февраль", "март", "апрель", "май", "июнь",
+              "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+
+    root = tk.Tk()
+    root.title("Выбор месяца")
+    root.geometry("350x200")
+    root.resizable(False, False)
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() // 2) - (350 // 2)
+    y = (root.winfo_screenheight() // 2) - (200 // 2)
+    root.geometry(f"350x200+{x}+{y}")
+    setup_styles()
+    result = [None]
+
+    def on_select():
+        result[0] = var.get()
+        root.destroy()
+
+    ttk.Label(root, text="Расчёт эффекта индексации", style='Title.TLabel').pack(pady=15)
+    ttk.Label(root, text="Выберите отчётный месяц:", style='Instruction.TLabel').pack(pady=5)
+    var = tk.StringVar(value="апрель")
+    ttk.Combobox(root, textvariable=var, values=months, state="readonly", font=('Segoe UI', 11), width=15).pack(pady=10)
+    ttk.Button(root, text="OK", command=on_select, style='Modern.TButton', width=15).pack(pady=15)
+    root.configure(bg='#f0f0f0')
+    root.mainloop()
+    return result[0]
+
+def select_mrf():
+    """Красивое окно выбора МРФ"""
+    mrfs = ["Урал", "Москва", "Центр", "Северо-Запад", "Юг", "Поволжье", 
+            "Сибирь", "Дальний Восток", "Другой"]
+    
+    root = tk.Tk()
+    root.title("Выбор МРФ")
+    root.geometry("350x200")
+    root.resizable(False, False)
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() // 2) - (350 // 2)
+    y = (root.winfo_screenheight() // 2) - (200 // 2)
+    root.geometry(f"350x200+{x}+{y}")
+    setup_styles()
+    result = [None]
+
+    def on_select():
+        result[0] = var.get()
+        root.destroy()
+
+    ttk.Label(root, text="Выбор МРФ", style='Title.TLabel').pack(pady=15)
+    ttk.Label(root, text="Выберите макрорегиональный филиал:", style='Instruction.TLabel').pack(pady=5)
+    var = tk.StringVar(value="Урал")
+    ttk.Combobox(root, textvariable=var, values=mrfs, state="readonly", font=('Segoe UI', 11), width=20).pack(pady=10)
+    ttk.Button(root, text="OK", command=on_select, style='Modern.TButton', width=15).pack(pady=15)
+    root.configure(bg='#f0f0f0')
+    root.mainloop()
+    return result[0]
+
+def select_column(df_columns, title_text, instruction_text):
+    root = tk.Tk()
+    root.title(title_text)
+    root.geometry("650x500")
+    root.resizable(True, True)
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() // 2) - (650 // 2)
+    y = (root.winfo_screenheight() // 2) - (500 // 2)
+    root.geometry(f"650x500+{x}+{y}")
+    setup_styles()
+    result = [None]
+
+    ttk.Label(root, text=title_text, style='Title.TLabel').pack(pady=10)
+    ttk.Label(root, text=instruction_text, style='Instruction.TLabel', wraplength=600).pack(pady=5)
+
+    search_frame = ttk.Frame(root)
+    search_frame.pack(pady=5, padx=20, fill=tk.X)
+    ttk.Label(search_frame, text="Поиск:").pack(side=tk.LEFT, padx=5)
+    search_var = tk.StringVar()
+    ttk.Entry(search_frame, textvariable=search_var, width=40).pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+    list_frame = ttk.Frame(root)
+    list_frame.pack(pady=5, padx=20, fill=tk.BOTH, expand=True)
+
+    scrollbar = ttk.Scrollbar(list_frame)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    listbox = tk.Listbox(list_frame, yscrollcommand=scrollbar.set, font=('Consolas', 9), selectmode=tk.SINGLE)
+    listbox.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.config(command=listbox.yview)
+
+    all_columns = list(df_columns)
+    for col in all_columns:
+        listbox.insert(tk.END, col)
+
+    def update_list(*args):
+        search_text = search_var.get().lower()
+        listbox.delete(0, tk.END)
+        for col in all_columns:
+            if search_text in col.lower():
+                listbox.insert(tk.END, col)
+
+    search_var.trace('w', update_list)
+
+    def on_select():
+        selection = listbox.curselection()
+        if selection:
+            result[0] = listbox.get(selection[0])
+        root.destroy()
+
+    listbox.bind('<Double-Button-1>', lambda e: on_select())
+    listbox.bind('<Return>', lambda e: on_select())
+
+    btn_frame = ttk.Frame(root)
+    btn_frame.pack(pady=15)
+    ttk.Button(btn_frame, text="Выбрать", command=on_select, style='Modern.TButton', width=15).pack(side=tk.LEFT, padx=10)
+    ttk.Button(btn_frame, text="Отмена", command=root.destroy, style='Modern.TButton', width=15).pack(side=tk.RIGHT, padx=10)
+
+    root.configure(bg='#f0f0f0')
+    root.mainloop()
+    return result[0]
+
+def ask_yes_no(title, text):
+    root = tk.Tk()
+    root.title(title)
+    root.geometry("430x180")
+    root.resizable(False, False)
+    root.attributes('-topmost', True)
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() // 2) - (430 // 2)
+    y = (root.winfo_screenheight() // 2) - (180 // 2)
+    root.geometry(f"430x180+{x}+{y}")
+    setup_styles()
+    result = [None]
+
+    ttk.Label(root, text=title, style='Title.TLabel').pack(pady=10)
+    ttk.Label(root, text=text, style='Instruction.TLabel', wraplength=380).pack(pady=8)
+
+    def yes():
+        result[0] = True
+        root.destroy()
+
+    def no():
+        result[0] = False
+        root.destroy()
+
+    btn_frame = ttk.Frame(root)
+    btn_frame.pack(pady=15)
+    ttk.Button(btn_frame, text="Да", command=yes, style='Modern.TButton', width=12).pack(side=tk.LEFT, padx=12)
+    ttk.Button(btn_frame, text="Нет", command=no, style='Modern.TButton', width=12).pack(side=tk.RIGHT, padx=12)
+
+    root.mainloop()
+    return result[0]
+
+def show_progress(message):
+    root = tk.Tk()
+    root.title("Информация")
+    root.geometry("600x500")
+    root.resizable(True, True)
+    root.lift()
+    root.attributes('-topmost', True)
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() // 2) - (600 // 2)
+    y = (root.winfo_screenheight() // 2) - (500 // 2)
+    root.geometry(f"600x500+{x}+{y}")
+    setup_styles()
+    
+    main_frame = ttk.Frame(root)
+    main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+    
+    canvas = tk.Canvas(main_frame, highlightthickness=0)
+    scrollbar = ttk.Scrollbar(main_frame, orient="vertical", command=canvas.yview)
+    scrollable_frame = ttk.Frame(canvas)
+    
+    scrollable_frame.bind(
+        "<Configure>",
+        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+    )
+    
+    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    
+    canvas.bind("<MouseWheel>", _on_mousewheel)
+    scrollable_frame.bind("<MouseWheel>", _on_mousewheel)
+    
+    text_widget = tk.Text(scrollable_frame, wrap=tk.WORD, font=('Segoe UI', 10), 
+                          relief=tk.FLAT, borderwidth=0, height=20)
+    text_widget.pack(fill=tk.BOTH, expand=True, pady=5)
+    text_widget.insert(tk.END, message)
+    text_widget.config(state=tk.DISABLED)
+    
+    button_frame = ttk.Frame(root)
+    button_frame.pack(pady=10)
+    ttk.Button(button_frame, text="OK", command=root.destroy, style='Modern.TButton', width=15).pack()
+    
+    root.configure(bg='#f0f0f0')
+    root.mainloop()
+
+def load_amounts_with_cache(file_path, month, mrf_name, force_reload=False):
+    """Загружает начисления с кэшированием в формате pickle (не требует дополнительных библиотек)"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cache_dir = os.path.join(script_dir, "cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    cache_file = os.path.join(cache_dir, f"{base_name}_{mrf_name}_{month}.pkl")
+    
+    if force_reload and os.path.exists(cache_file):
+        os.remove(cache_file)
+        print(f"   🔄 Принудительная перезагрузка (кэш удалён)")
+    
+    if os.path.exists(cache_file):
+        cache_time = os.path.getmtime(cache_file)
+        source_time = os.path.getmtime(file_path)
+        if cache_time > source_time:
+            print(f"   ⏳ Загрузка из кэша: {cache_file}")
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
+    
+    print(f"   ⏳ Загрузка начислений (в первый раз, будет сохранено в кэш)...")
+    print("   ⚠️ Файл большой, может занять 1-3 минуты...")
+    df = pd.read_excel(file_path, sheet_name="Sheet")
+    
+    with open(cache_file, 'wb') as f:
+        pickle.dump(df, f)
+    print(f"   ✓ Сохранено в кэш: {cache_file}")
+    
+    return df
+
+def filter_window(df_report):
+    cols = [c for c in ["Услуга.1", "МРФ", "РФ", "Краткий Сегмент", "Подсегмент"] if c in df_report.columns]
+    if not cols:
+        cols = [c for c in ["Услуга", "МРФ", "РФ", "Краткий Сегмент", "Подсегмент"] if c in df_report.columns]
+    if not cols:
+        return None
+
+    result = {"selected": None, "date": None}
+
+    root = tk.Tk()
+    root.title("Фильтры Таблицы 3")
+    root.geometry("1000x800")
+    root.resizable(True, True)
+    root.attributes('-topmost', True)
+    root.update_idletasks()
+    x = (root.winfo_screenwidth() // 2) - (1000 // 2)
+    y = (root.winfo_screenheight() // 2) - (800 // 2)
+    root.geometry(f"1000x800+{x}+{y}")
+    setup_styles()
+
+    ttk.Label(root, text="Выбор фильтров для Таблицы 3", style='Title.TLabel').pack(pady=10)
+    ttk.Label(root, text="Сначала выберите ДАТУ ИНДЕКСАЦИИ, затем отметьте галочками нужные значения", 
+              style='Instruction.TLabel', wraplength=900).pack(pady=5)
+
+    main_container = ttk.Frame(root)
+    main_container.pack(fill=tk.BOTH, expand=True, padx=15, pady=10)
+
+    canvas = tk.Canvas(main_container, highlightthickness=0)
+    scrollbar = ttk.Scrollbar(main_container, orient="vertical", command=canvas.yview)
+    scroll_frame = ttk.Frame(canvas)
+
+    scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+
+    canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    
+    def _bind_mousewheel(widget):
+        widget.bind("<MouseWheel>", _on_mousewheel)
+        widget.bind("<Button-4>", lambda e: canvas.yview_scroll(-1, "units"))
+        widget.bind("<Button-5>", lambda e: canvas.yview_scroll(1, "units"))
+    
+    _bind_mousewheel(canvas)
+    _bind_mousewheel(scroll_frame)
+
+    date_frame = ttk.LabelFrame(scroll_frame, text="Выбор даты индексации", padding=10)
+    date_frame.pack(fill=tk.X, padx=5, pady=5)
+
+    if 'Дата индексации' in df_report.columns:
+        unique_dates = df_report['Дата индексации'].dropna().unique()
+        unique_dates = sorted(unique_dates, reverse=True)
+        date_var = tk.StringVar(value="(выберите дату)")
+        date_combo = ttk.Combobox(date_frame, textvariable=date_var, values=["(выберите дату)"] + list(unique_dates), 
+                                   state="readonly", width=30, font=('Segoe UI', 10))
+        date_combo.pack(pady=5, padx=10)
+        ttk.Label(date_frame, text="Выберите дату индексации, для которой будете заполнять эффект", 
+                  style='Instruction.TLabel', wraplength=800).pack(pady=5)
+    else:
+        date_var = None
+        ttk.Label(date_frame, text="В отчёте нет колонки с датой индексации", 
+                  style='Instruction.TLabel', foreground='red').pack(pady=5)
+
+    checkbox_vars = {}
+
+    def make_values(col, df_filtered=None):
+        if df_filtered is None:
+            df_filtered = df_report
+        s = df_filtered[col].dropna()
+        if col == "РФ":
+            vals = [norm_text(RF_MAPPING.get(str(v).strip(), str(v).strip())) for v in s]
+        else:
+            vals = [norm_text(v) for v in s]
+        vals = [v for v in vals if v != ""]
+        vals = sorted(list(dict.fromkeys(vals)))
+        return vals
+
+    for i, col in enumerate(cols):
+        display_name = col.replace(".1", "")
+        values = make_values(col)
+        
+        group_frame = ttk.LabelFrame(scroll_frame, text=display_name, padding=10)
+        group_frame.pack(fill=tk.X, padx=5, pady=5)
+        
+        btn_frame = ttk.Frame(group_frame)
+        btn_frame.pack(fill=tk.X, pady=5)
+        
+        check_frame = ttk.Frame(group_frame)
+        check_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+        
+        if len(values) > 10:
+            check_canvas = tk.Canvas(check_frame, height=150, highlightthickness=0)
+            check_scrollbar = ttk.Scrollbar(check_frame, orient="vertical", command=check_canvas.yview)
+            check_inner = ttk.Frame(check_canvas)
+            
+            check_inner.bind("<Configure>", lambda e: check_canvas.configure(scrollregion=check_canvas.bbox("all")))
+            check_canvas.create_window((0, 0), window=check_inner, anchor="nw")
+            check_canvas.configure(yscrollcommand=check_scrollbar.set)
+            
+            check_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            check_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+            
+            _bind_mousewheel(check_canvas)
+            
+            check_container = check_inner
+        else:
+            check_container = check_frame
+        
+        checkbox_vars[col] = {}
+        
+        def select_all(col=col, vars_dict=checkbox_vars[col]):
+            for val, var in vars_dict.items():
+                var.set(True)
+        
+        def deselect_all(col=col, vars_dict=checkbox_vars[col]):
+            for val, var in vars_dict.items():
+                var.set(False)
+        
+        ttk.Button(btn_frame, text="✓ Выбрать всё", command=select_all, width=15).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_frame, text="✗ Снять всё", command=deselect_all, width=15).pack(side=tk.LEFT, padx=2)
+        
+        max_cols = 3
+        rows_per_col = (len(values) + max_cols - 1) // max_cols
+        
+        for idx, val in enumerate(values):
+            row = idx % rows_per_col
+            col_num = idx // rows_per_col
+            
+            frame = ttk.Frame(check_container)
+            frame.grid(row=row, column=col_num, sticky="w", padx=10, pady=2)
+            
+            var = tk.BooleanVar(value=False)
+            checkbox_vars[col][val] = var
+            ttk.Checkbutton(frame, text=val, variable=var, width=35).pack(side=tk.LEFT)
+            
+            _bind_mousewheel(frame)
+        
+        for c in range(max_cols):
+            check_container.columnconfigure(c, weight=1)
+
+    def on_apply():
+        if date_var is None or date_var.get() == "(выберите дату)":
+            messagebox.showwarning("Внимание", "Пожалуйста, выберите дату индексации!")
+            return
+        
+        selected = {}
+        for col in cols:
+            selected_values = [val for val, var in checkbox_vars[col].items() if var.get()]
+            if selected_values:
+                selected[col] = selected_values
+        
+        result["selected"] = selected
+        result["date"] = date_var.get()
+        root.destroy()
+
+    def on_clear():
+        for col in cols:
+            for val, var in checkbox_vars[col].items():
+                var.set(False)
+        if date_var is not None:
+            date_var.set("(выберите дату)")
+
+    btn_frame = ttk.Frame(root)
+    btn_frame.pack(pady=15)
+    ttk.Button(btn_frame, text="Применить фильтры", command=on_apply, style='Modern.TButton', width=18).pack(side=tk.LEFT, padx=8)
+    ttk.Button(btn_frame, text="Сбросить всё", command=on_clear, style='Modern.TButton', width=15).pack(side=tk.LEFT, padx=8)
+    ttk.Button(btn_frame, text="Отмена", command=root.destroy, style='Modern.TButton', width=15).pack(side=tk.LEFT, padx=8)
+
+    root.mainloop()
+    return result
+
+def main():
+    program_start = datetime.now()
+
+    print("=" * 60)
+    print("РАСЧЁТ ФАКТИЧЕСКОГО ЭФФЕКТА ОТ ИНДЕКСАЦИИ")
+    print("=" * 60)
+
+    month = select_month()
+    if not month:
+        print("Месяц не выбран. Выход.")
+        return
+    print(f"\n1. Отчётный месяц: {month}")
+
+    print("\n1.5. Выберите МРФ...")
+    mrf_name = select_mrf()
+    if not mrf_name:
+        print("МРФ не выбран. Выход.")
+        return
+    print(f"   Выбран МРФ: {mrf_name}")
+
+    print("\n2. Загрузите БАЗУ ИНДЕКСАЦИИ...")
+    table2_path = select_file("Выберите файл с базой индексации")
+    if not table2_path:
+        print("Файл не выбран. Выход.")
+        return
+    print(f"   Загружено: {os.path.basename(table2_path)}")
+
+    print(f"\n3. Загрузите НАЧИСЛЕНИЯ за {month} для МРФ {mrf_name}...")
+    table1_path = select_file(f"Выберите файл с начислениями за {month} (МРФ {mrf_name})")
+    if not table1_path:
+        print("Файл не выбран. Выход.")
+        return
+    print(f"   Загружено: {os.path.basename(table1_path)}")
+    
+    force_reload = ask_yes_no("Кэш", "Принудительно перезагрузить файл начислений (очистить кэш)?")
+    
+    df_amount = load_amounts_with_cache(table1_path, month, mrf_name, force_reload)
+
+    print("\n4. Загрузите ОТЧЁТ (Таблица 3) для обновления...")
+    table3_path = select_file("Выберите файл отчёта (Таблица 3)")
+    if not table3_path:
+        print("Файл не выбран. Выход.")
+        return
+    print(f"   Отчёт: {os.path.basename(table3_path)}")
+
+    SHEET_TABLE2 = "Лист1"
+    SHEET_TABLE3 = "СЗ Факт-эффект индексации 2026"
+
+    print("\n" + "=" * 50)
+    print("ЗАГРУЗКА ДАННЫХ...")
+    print("=" * 50)
+    total_start = datetime.now()
+
+    try:
+        print(f"⏳ Загрузка базы индексации (лист: {SHEET_TABLE2})...")
+        start = datetime.now()
+        df_base = pd.read_excel(table2_path, sheet_name=SHEET_TABLE2)
+        print(f"   ✓ База индексации: {len(df_base):,} строк (за {(datetime.now() - start).total_seconds():.1f} сек)")
+
+        print(f"⏳ Загрузка отчёта (лист: {SHEET_TABLE3})...")
+        start = datetime.now()
+        df_report = pd.read_excel(table3_path, sheet_name=SHEET_TABLE3)
+        print(f"   ✓ Отчёт: {len(df_report):,} строк (за {(datetime.now() - start).total_seconds():.1f} сек)")
+        
+        print(f"   ✓ Начисления: {len(df_amount):,} строк (загружено из кэша или файла)")
+
+    except Exception as e:
+        print(f"\n❌ Ошибка загрузки: {e}")
+        input("Нажмите Enter для выхода...")
+        return
+
+    total_load_time = (datetime.now() - total_start).total_seconds()
+    print(f"\n   📊 ИТОГО загрузка: {total_load_time:.1f} сек")
+
+    print("\n" + "=" * 50)
+    print("АНАЛИЗ ДАННЫХ...")
+    print("=" * 50)
+
+    print("\n5. Выберите колонку в базе индексации, которая содержит 'начисление ДО индексации'...")
+    base_col = select_column(
+        df_base.columns,
+        "Выбор колонки - начисление ДО индексации",
+        "Выберите колонку, которая содержит НАЧИСЛЕНИЕ ДО ИНДЕКСАЦИИ\n(например, 'Начисление Ноябрь' или 'Начисления без НДС'):"
+    )
+    if not base_col:
+        print("Колонка не выбрана. Выход.")
+        return
+    print(f"   Выбрана колонка: {base_col}")
+
+    possible_id_cols = ["MSISDN", "Уникальный идентификационный номер услуги (ШПД, VPN -  логин порта)",
+                        "Уникальный идентификационный номер услуги", "MSISDN/Логин"]
+    id_col = None
+    for col in possible_id_cols:
+        if col in df_base.columns:
+            id_col = col
+            break
+    if id_col is None:
+        print("\n" + "=" * 50)
+        print("⚠️  Колонка с идентификатором MSISDN не найдена автоматически.")
+        print("=" * 50)
+        print("Программа не смогла определить, в какой колонке находятся")
+        print("уникальные номера абонентов (MSISDN/логины).")
+        print("\nСейчас откроется окно, в котором нужно выбрать эту колонку вручную.")
+        print("Обычно она называется: 'MSISDN' или 'Уникальный идентификационный номер услуги'")
+        print("=" * 50)
+        input("Нажмите Enter, чтобы продолжить...")
+        
+        id_col = select_column(
+            df_base.columns,
+            "Выбор колонки - идентификатор абонента",
+            "Выберите колонку, которая содержит УНИКАЛЬНЫЙ ИДЕНТИФИКАТОР АБОНЕНТА\n(MSISDN, логин, номер услуги, номер лицевого счёта):"
+        )
+        if not id_col:
+            print("❌ Колонка не выбрана. Выход.")
+            return
+        print(f"\n✅ Выбрана колонка: {id_col}")
+    
+    print(f"   ✅ Идентификатор (MSISDN): {id_col}")
+
+    amount_col = f"Без НДС {month}"
+    if amount_col not in df_amount.columns:
+        print(f"\n❌ ОШИБКА: В файле начислений нет колонки '{amount_col}'")
+        input("Нажмите Enter для выхода...")
+        return
+    print(f"   Колонка с начислениями за {month}: {amount_col}")
+
+    # Группировка по Продукт, МРФ, РФ, Краткий сегмент, Подсегмент
+    group_cols_base = ["Продукт", "МРФ", "РФ", "Краткий сегмент", "Подсегмент"]
+    available_group_cols = [col for col in group_cols_base if col in df_base.columns]
+    if not available_group_cols:
+        print("\n❌ ОШИБКА: В базе индексации нет нужных колонок для группировки")
+        print("Доступные колонки:", list(df_base.columns[:20]))
+        input("Нажмите Enter для выхода...")
+        return
+    print(f"   Колонки для группировки: {available_group_cols}")
+
+    print("\n⏳ Преобразование данных в числа...")
+    df_base[base_col] = pd.to_numeric(df_base[base_col], errors='coerce')
+    df_amount[amount_col] = pd.to_numeric(df_amount[amount_col], errors='coerce')
+
+    print("⏳ Подготовка идентификаторов...")
+    df_base[id_col] = df_base[id_col].astype(str).str.strip()
+    df_base[id_col] = df_base[id_col].str.replace('.0', '').str.strip()
+    
+    if "MSISDN" in df_amount.columns:
+        df_amount["MSISDN"] = df_amount["MSISDN"].astype(str).str.strip()
+        df_amount["MSISDN"] = df_amount["MSISDN"].str.replace('.0', '').str.strip()
+    else:
+        print("❌ ОШИБКА: В файле начислений нет колонки 'MSISDN'")
+        input("Нажмите Enter для выхода...")
+        return
+
+    print("⏳ Соединение таблиц...")
+    start = datetime.now()
+    merged = df_base.merge(df_amount[["MSISDN", amount_col]], left_on=id_col, right_on="MSISDN", how='left')
+    print(f"   ✓ Соединено строк: {len(merged):,} (за {(datetime.now() - start).total_seconds():.1f} сек)")
+
+    print("⏳ Расчёт эффекта...")
+    merged['Эффект_руб'] = merged[amount_col] - merged[base_col]
+    merged.loc[merged['Эффект_руб'] < 0, 'Эффект_руб'] = 0
+    print(f"   ✓ Абонентов с положительным эффектом: {(merged['Эффект_руб'] > 0).sum():,}")
+    print(f"   ✓ Абонентов с нулевым эффектом: {(merged['Эффект_руб'] == 0).sum():,}")
+
+    print("⏳ Группировка данных (по Продукт, МРФ, РФ, Краткий сегмент, Подсегмент)...")
+    start = datetime.now()
+    pivot = merged.groupby(available_group_cols, as_index=False)['Эффект_руб'].sum()
+    pivot['Эффект_тыс'] = (pivot['Эффект_руб'] / 1000).round(3)
+    print(f"\n   Рассчитано групп: {len(pivot)} (за {(datetime.now() - start).total_seconds():.1f} сек)")
+    print(f"   Общий эффект: {pivot['Эффект_тыс'].sum():,.3f} тыс. руб.")
+
+    if len(pivot) == 0:
+        print("❌ Пустой pivot. Выход.")
+        return
+
+    months_with_fact = ["май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+    target_col = None
+    for col in df_report.columns:
+        col_s = str(col).lower()
+        if month in col_s and 'эффект от индексации' in col_s:
+            if month in months_with_fact:
+                if 'факт' in col_s:
+                    target_col = col
+                    break
+            else:
+                if 'факт' not in col_s:
+                    target_col = col
+                    break
+
+    if target_col is None:
+        print(f"\n❌ ОШИБКА: В отчёте нет колонки для месяца {month}")
+        input("Нажмите Enter для выхода...")
+        return
+
+    print(f"\n   Целевая колонка: {target_col}")
+
+    print("\n" + "=" * 50)
+    print("ВЫБОР ФИЛЬТРОВ")
+    print("=" * 50)
+
+    selected_filters = filter_window(df_report)
+    if selected_filters is None:
+        print("Выбор фильтров отменён. Выход.")
+        return
+
+    print("\n" + "=" * 50)
+    print("ПОСТРОЧНОЕ СОПОСТАВЛЕНИЕ С ОТЧЁТОМ")
+    print("=" * 50)
+    
+    selected_date = selected_filters.get("date")
+    if not selected_date:
+        print("❌ Дата не выбрана в фильтрах!")
+        input("Нажмите Enter для выхода...")
+        return
+    
+    print(f"   Выбранная дата индексации: {selected_date}")
+    
+    # Создаём словарь отчёта по Услуга.1, МРФ, РФ, Краткий Сегмент, Подсегмент
+    report_dict = {}
+    for idx, row in df_report.iterrows():
+        report_date = norm_date(row['Дата индексации']) if 'Дата индексации' in df_report.columns else ""
+        if report_date != norm_date(selected_date):
+            continue
+        
+        key_parts = []
+        
+        if 'Услуга.1' in df_report.columns:
+            service_val = norm_text(row['Услуга.1'])
+        elif 'Услуга' in df_report.columns:
+            service_val = norm_text(row['Услуга'])
+        else:
+            service_val = ""
+        key_parts.append(service_val)
+        
+        if 'МРФ' in df_report.columns:
+            mrf_val = norm_text(row['МРФ'])
+        else:
+            mrf_val = ""
+        key_parts.append(mrf_val)
+        
+        if 'РФ' in df_report.columns:
+            rf_val = norm_text(RF_MAPPING.get(str(row['РФ']).strip(), str(row['РФ']).strip()))
+        else:
+            rf_val = ""
+        key_parts.append(rf_val)
+        
+        if 'Краткий Сегмент' in df_report.columns:
+            segment_val = norm_text(row['Краткий Сегмент'])
+        else:
+            segment_val = ""
+        key_parts.append(segment_val)
+        
+        if 'Подсегмент' in df_report.columns:
+            subsegment_val = norm_text(row['Подсегмент'])
+        else:
+            subsegment_val = ""
+        key_parts.append(subsegment_val)
+        
+        key = tuple(key_parts)
+        report_dict[key] = idx
+    
+    print(f"   В отчёте с датой {selected_date} найдено {len(report_dict)} уникальных комбинаций")
+    
+    selected_segments = selected_filters.get("selected", {})
+    
+    updated_count = 0
+    matched_indices = []
+    
+    print("\n   --- СОПОСТАВЛЕНИЕ СТРОК PIVOT ---")
+    
+    for pivot_idx, pivot_row in pivot.iterrows():
+        key_parts = []
+        
+        if 'Продукт' in pivot_row.index:
+            product_val = norm_text(pivot_row['Продукт'])
+        else:
+            product_val = ""
+        key_parts.append(product_val)
+        
+        if 'МРФ' in pivot_row.index:
+            mrf_val = norm_text(pivot_row['МРФ'])
+        else:
+            mrf_val = ""
+        key_parts.append(mrf_val)
+        
+        if 'РФ' in pivot_row.index:
+            rf_val = norm_text(RF_MAPPING.get(str(pivot_row['РФ']).strip(), str(pivot_row['РФ']).strip()))
+        else:
+            rf_val = ""
+        key_parts.append(rf_val)
+        
+        if 'Краткий сегмент' in pivot_row.index:
+            segment_val = norm_text(pivot_row['Краткий сегмент'])
+        else:
+            segment_val = ""
+        key_parts.append(segment_val)
+        
+        if 'Подсегмент' in pivot_row.index:
+            subsegment_val = norm_text(pivot_row['Подсегмент'])
+        else:
+            subsegment_val = ""
+        key_parts.append(subsegment_val)
+        
+        key = tuple(key_parts)
+        
+        # Проверяем фильтры
+        segment_ok = True
+        for filter_col, filter_values in selected_segments.items():
+            filter_col_clean = filter_col.replace(".1", "")
+            if filter_col_clean == "Услуга":
+                if product_val not in filter_values:
+                    segment_ok = False
+                    break
+            elif filter_col_clean == "МРФ":
+                if mrf_val not in filter_values:
+                    segment_ok = False
+                    break
+            elif filter_col_clean == "РФ":
+                if rf_val not in filter_values:
+                    segment_ok = False
+                    break
+            elif filter_col_clean == "Краткий Сегмент":
+                if segment_val not in filter_values:
+                    segment_ok = False
+                    break
+            elif filter_col_clean == "Подсегмент":
+                if subsegment_val not in filter_values:
+                    segment_ok = False
+                    break
+        
+        if not segment_ok:
+            continue
+        
+        if key in report_dict:
+            report_idx = report_dict[key]
+            effect_value = pivot_row['Эффект_тыс']
+            df_report.loc[report_idx, target_col] = effect_value
+            matched_indices.append(report_idx)
+            updated_count += 1
+            
+            if updated_count <= 5:
+                print(f"   ✓ Сопоставлено: Услуга='{product_val}', МРФ='{mrf_val}', РФ='{rf_val}', Сегмент='{segment_val}', Подсегмент='{subsegment_val}'")
+                print(f"     -> записано значение: {effect_value:.3f} тыс. руб.")
+        else:
+            if pivot_idx < 5:
+                print(f"   ✗ НЕ найдено: Услуга='{product_val}', МРФ='{mrf_val}', РФ='{rf_val}', Сегмент='{segment_val}', Подсегмент='{subsegment_val}'")
+    
+    print(f"\n   ✓ Обновлено строк в отчёте: {updated_count} из {len(pivot)}")
+    
+    if updated_count == 0:
+        print("\n❌ Нет сопоставлений! Проверьте:")
+        print(f"   - есть ли в отчёте строки с датой {selected_date}")
+        print("   - совпадают ли названия услуг, МРФ, РФ и сегментов")
+        input("Нажмите Enter для выхода...")
+        return
+
+    print("\n" + "=" * 50)
+    print("СОХРАНЕНИЕ РЕЗУЛЬТАТА...")
+    print("=" * 50)
+
+    save_choice = ask_yes_no("Сохранение", "Сохранить изменения в том же файле?")
+    if save_choice:
+        save_path = table3_path
+        print(f"\n⏳ Сохранение в тот же файл: {os.path.basename(save_path)}")
+    else:
+        default_name = f"отчет_эффект_{mrf_name}_{month}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        save_path = select_save_file("Сохранить отчёт как", default_name)
+        if not save_path:
+            print("Сохранение отменено.")
+            return
+        print(f"\n⏳ Сохранение в новый файл: {os.path.basename(save_path)}")
+
+    try:
+        start = datetime.now()
+        with pd.ExcelWriter(save_path, engine='openpyxl', mode='w') as writer:
+            df_report.to_excel(writer, sheet_name=SHEET_TABLE3, index=False)
+
+        wb = load_workbook(save_path)
+        ws = wb[SHEET_TABLE3]
+        green_fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
+        target_col_idx = list(df_report.columns).index(target_col) + 1
+
+        for row_idx in matched_indices:
+            ws.cell(row=row_idx + 2, column=target_col_idx).fill = green_fill
+
+        wb.save(save_path)
+        print(f"\n✓ Отчёт сохранён: {save_path} (за {(datetime.now() - start).total_seconds():.1f} сек)")
+        print(f"   🟢 Зелёным выделены {len(matched_indices)} обновлённых ячеек")
+    except Exception as e:
+        print(f"❌ Ошибка при сохранении: {e}")
+        input("Нажмите Enter...")
+        return
+
+    total_time = (datetime.now() - program_start).total_seconds()
+
+    print("\n" + "=" * 50)
+    print("ГОТОВО!")
+    print("=" * 50)
+    print(f"\n📊 Сводка по времени:")
+    print(f"   Загрузка файлов: {total_load_time:.1f} сек")
+    print(f"   Обработка данных: {(total_time - total_load_time):.1f} сек")
+    print(f"   ОБЩЕЕ ВРЕМЯ: {total_time:.1f} сек ({total_time/60:.1f} мин)")
+
+    show_progress(
+        f"Расчёт за {month} 2026 завершён!\n\n"
+        f"Обновлено строк в отчёте: {updated_count}\n"
+        f"Общий эффект: {pivot['Эффект_тыс'].sum():,.3f} тыс. руб.\n\n"
+        f"🟢 Зелёным выделены обновлённые ячейки"
+    )
+
+    print("\nНажмите Enter для выхода...")
+    input()
+
+if __name__ == "__main__":
+    main()
