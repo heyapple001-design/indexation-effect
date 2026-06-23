@@ -1,0 +1,1256 @@
+"""
+Расчёт фактического эффекта от индексации
+Версия с PyQt5 интерфейсом
+"""
+
+import sys
+import os
+import json
+import pathlib
+from datetime import datetime
+from typing import Optional, Dict, List, Any, Tuple
+
+import pandas as pd
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QComboBox, QPushButton, QFileDialog, QMessageBox,
+    QProgressBar, QTextEdit, QGroupBox, QCheckBox, QScrollArea,
+    QFrame, QLineEdit, QListWidget, QListWidgetItem, QTabWidget,
+    QDialog, QDialogButtonBox, QRadioButton, QButtonGroup,
+    QSplitter
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QFont, QPalette, QColor, QIcon
+
+
+# ============================================================================
+# КОНСТАНТЫ
+# ============================================================================
+
+# Цветовая схема
+COLOR_PRIMARY = "#0078D4"
+COLOR_PRIMARY_LIGHT = "#CCE4F7"
+COLOR_SUCCESS = "#C6EFCE"
+COLOR_ADDED = "#DDEBF7"
+COLOR_WARNING = "#FFEB9C"
+COLOR_DANGER = "#C42B1C"
+
+# Названия листов
+SHEET_TABLE2 = "Лист1"  # База индексации
+SHEET_TABLE1 = "Sheet"  # Начисления
+SHEET_TABLE3 = "Факт-эффект индексации 2026"  # Отчёт
+
+# Колонки базы
+BASE_COL_SERVICE = "Услуга"
+BASE_COL_DATE = "Дата индексации"
+BASE_COL_PCT = "% индексации"
+BASE_COL_MRF = "МРФ"
+BASE_COL_RF = "РФ"
+BASE_COL_SEGMENT = "Краткий сегмент"
+BASE_COL_SUBSEG = "Подсегмент"
+BASE_COL_SEGMENT1 = "Сегмент1"
+
+# Колонки отчёта
+RPT_COL_SERVICE = "Услуга"
+RPT_COL_DATE = "Дата индексации"
+RPT_COL_PCT = "Процент индексации"
+RPT_COL_MRF = "МРФ"
+RPT_COL_RF = "РФ"
+RPT_COL_SEGMENT = "Краткий Сегмент"
+RPT_COL_SUBSEG = "Подсегмент"
+RPT_COL_SEGMENT1 = "Сегмент"
+
+TARGET_COL_KEYWORDS = ["эффект от индексации", "факт"]
+
+# Режимы
+MODE_EXTERNAL = "external"
+MODE_INBASE = "inbase"
+
+# Заливки
+FILL_UPDATED = "C6EFCE"
+FILL_ADDED = "DDEBF7"
+FILL_NOT_FOUND = "FFEB9C"
+
+MONTHS = ["январь", "февраль", "март", "апрель", "май", "июнь",
+          "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"]
+
+
+# ============================================================================
+# ЗАГРУЗКА СПРАВОЧНИКОВ
+# ============================================================================
+
+_mappings = None
+
+
+def load_mappings() -> Dict:
+    """Загружает справочники из data/mappings.json"""
+    global _mappings
+    
+    if _mappings is not None:
+        return _mappings
+    
+    json_path = pathlib.Path(__file__).parent / "data" / "mappings.json"
+    
+    if not json_path.exists():
+        raise FileNotFoundError(
+            f"Файл справочников не найден: {json_path}\n"
+            "Убедитесь что папка data/ с файлом mappings.json лежит рядом с программой."
+        )
+    
+    with open(json_path, encoding="utf-8") as f:
+        _mappings = json.load(f)
+    
+    return _mappings
+
+
+def get_all_mrf() -> List[str]:
+    """Возвращает список всех МРФ"""
+    m = load_mappings()
+    return m.get("ALL_MRF", [])
+
+
+def get_mrf_to_rf() -> Dict:
+    """Возвращает словарь МРФ -> РФ"""
+    m = load_mappings()
+    return m.get("MRF_TO_RF", {})
+
+
+def get_rf_mapping() -> Dict:
+    """Возвращает словарь РФ -> нормализованное значение"""
+    m = load_mappings()
+    return m.get("RF_MAPPING", {})
+
+
+def get_rf_reverse() -> Dict:
+    """Возвращает обратный словарь РФ"""
+    m = load_mappings()
+    return m.get("RF_REVERSE", {})
+
+
+def get_service_exact() -> Dict:
+    """Возвращает точные соответствия услуг"""
+    m = load_mappings()
+    return m.get("SERVICE_EXACT", {})
+
+
+def get_mrf_exact() -> Dict:
+    """Возвращает точные соответствия МРФ"""
+    m = load_mappings()
+    return m.get("MRF_EXACT", {})
+
+
+def get_uppercase_services() -> set:
+    """Возвращает набор услуг, которые пишутся заглавными"""
+    m = load_mappings()
+    return set(m.get("UPPERCASE_SERVICES", []))
+
+
+# ============================================================================
+# ФУНКЦИИ ФОРМАТИРОВАНИЯ
+# ============================================================================
+
+def norm_text(x: Any) -> str:
+    """Нормализует текст для сравнения"""
+    if pd.isna(x):
+        return ""
+    return " ".join(str(x).replace("\xa0", " ").strip().lower().split())
+
+
+def norm_date(x: Any) -> str:
+    """Нормализует дату к строке DD.MM.YYYY"""
+    if x is None or pd.isna(x):
+        return ""
+    try:
+        dt = pd.to_datetime(x, errors="coerce", dayfirst=True)
+        if pd.isna(dt):
+            return str(x).strip()
+        return dt.strftime("%d.%m.%Y")
+    except:
+        return str(x).strip()
+
+
+def fmt_title(x: Any) -> Any:
+    """Первое слово с заглавной, остальное строчное"""
+    if pd.isna(x) or str(x).strip() == "":
+        return x
+    s = str(x).strip()
+    return s[0].upper() + s[1:].lower()
+
+
+def fmt_upper(x: Any) -> Any:
+    """Все заглавными"""
+    if pd.isna(x) or str(x).strip() == "":
+        return x
+    return str(x).strip().upper()
+
+
+def fmt_mrf(x: Any) -> Any:
+    """Нормализует название МРФ"""
+    if pd.isna(x) or str(x).strip() == "":
+        return x
+    key = str(x).strip().lower()
+    mrf_exact = get_mrf_exact()
+    if key in mrf_exact:
+        return mrf_exact[key]
+    return fmt_title(x)
+
+
+def fmt_service(x: Any) -> Any:
+    """Форматирует название услуги"""
+    if pd.isna(x) or str(x).strip() == "":
+        return x
+    s = str(x).strip()
+    key = s.lower()
+    service_exact = get_service_exact()
+    if key in service_exact:
+        return service_exact[key]
+    uppercase_services = get_uppercase_services()
+    if key in uppercase_services:
+        return s.upper()
+    return fmt_title(s)
+
+
+def fmt_seg(x: Any) -> Any:
+    """Форматирует сегмент/подсегмент"""
+    import re
+    if pd.isna(x) or str(x).strip() == "":
+        return x
+    s = str(x).strip()
+    ABBREVS = {'мсп', 'смп', 'мрф', 'фэс', 'днк', 'ккфу', 'фу', 'ру', 'вп', 'оп', 'нк', 'топ'}
+    result = []
+    for word in s.split():
+        if re.search(r'[a-zA-Z0-9]', word):
+            result.append(word.upper())
+        elif word.lower() in ABBREVS:
+            result.append(word.upper())
+        else:
+            result.append(word.capitalize())
+    return ' '.join(result)
+
+
+def fmt_pct(x: Any) -> Any:
+    """Приводит % к числу 0..1"""
+    try:
+        v = float(str(x).replace(",", ".").replace("%", "").strip())
+        return v / 100 if v > 1 else v
+    except (ValueError, TypeError):
+        return x
+
+
+def fmt_num3(x: Any) -> Any:
+    """Число с 3 знаками после запятой"""
+    try:
+        return round(float(x), 3)
+    except (ValueError, TypeError):
+        return x
+
+
+def find_col_name(df: pd.DataFrame, name: str) -> Optional[str]:
+    """Ищет колонку нечувствительно к регистру"""
+    name_lower = name.strip().lower()
+    for c in df.columns:
+        if str(c).strip().lower() == name_lower:
+            return c
+    return None
+
+
+def map_rf(raw_value: Any) -> str:
+    """Маппинг РФ"""
+    raw_str = str(raw_value).strip()
+    rf_mapping = get_rf_mapping()
+    if raw_str in rf_mapping:
+        return norm_text(rf_mapping[raw_str])
+    raw_lower = raw_str.lower()
+    if raw_lower in rf_mapping:
+        return norm_text(rf_mapping[raw_lower])
+    return norm_text(raw_str)
+
+
+def unmap_rf(canon_value: Any) -> str:
+    """Конвертирует каноническое название в полное официальное"""
+    key = " ".join(str(canon_value).replace("\xa0", " ").strip().lower().split())
+    rf_reverse = get_rf_reverse()
+    return rf_reverse.get(key, canon_value)
+
+
+# ============================================================================
+# РАБОЧИЙ ПОТОК ДЛЯ ВЫЧИСЛЕНИЙ
+# ============================================================================
+
+class CalculationThread(QThread):
+    """Поток для выполнения вычислений без блокировки интерфейса"""
+    
+    progress = pyqtSignal(int, str)
+    log = pyqtSignal(str)
+    finished = pyqtSignal(object)
+    error = pyqtSignal(str)
+    
+    def __init__(self, params: Dict):
+        super().__init__()
+        self.params = params
+        self._is_running = True
+    
+    def stop(self):
+        self._is_running = False
+    
+    def run(self):
+        try:
+            self._do_calculation()
+        except Exception as e:
+            self.error.emit(str(e))
+            import traceback
+            traceback.print_exc()
+    
+    def _do_calculation(self):
+        """Основная логика расчёта"""
+        month = self.params['month']
+        mrf_name = self.params['mrf_name']
+        report_path = self.params['report_path']
+        base_path = self.params['base_path']
+        charges_mode = self.params['charges_mode']
+        base_col = self.params['base_col']
+        target_col = self.params['target_col']
+        amount_col = self.params.get('amount_col', f"Без НДС {month}")
+        current_col = self.params.get('current_col')
+        charges_path = self.params.get('charges_path')
+        filters = self.params.get('filters', {})
+        
+        self.log.emit(f"🚀 Начинаем расчёт для МРФ: {mrf_name}")
+        self.progress.emit(5, "Загрузка отчёта...")
+        
+        # Загрузка отчёта
+        df_report = pd.read_excel(report_path, sheet_name=SHEET_TABLE3)
+        self.log.emit(f"✅ Отчёт загружен: {len(df_report)} строк")
+        
+        self.progress.emit(10, "Загрузка базы индексации...")
+        
+        # Загрузка базы
+        df_base = pd.read_excel(base_path, sheet_name=SHEET_TABLE2)
+        self.log.emit(f"✅ База индексации загружена: {len(df_base)} строк")
+        
+        # Загрузка начислений (режим А)
+        df_amount = None
+        if charges_mode == MODE_EXTERNAL and charges_path:
+            self.progress.emit(20, "Загрузка файла начислений...")
+            df_amount = pd.read_excel(charges_path, sheet_name=SHEET_TABLE1)
+            self.log.emit(f"✅ Начисления загружены: {len(df_amount)} строк")
+            
+            # Проверка колонок
+            if amount_col not in df_amount.columns:
+                raise ValueError(f"Колонка '{amount_col}' не найдена в файле начислений")
+            if "MSISDN" not in df_amount.columns:
+                raise ValueError("Колонка 'MSISDN' не найдена в файле начислений")
+        
+        self.progress.emit(30, "Подготовка данных...")
+        
+        # Группировка
+        gcols = [c for c in [BASE_COL_MRF, BASE_COL_RF, BASE_COL_SEGMENT, 
+                            BASE_COL_SUBSEG, BASE_COL_SEGMENT1]
+                if c in df_base.columns]
+        
+        if not gcols:
+            raise ValueError("Нет колонок группировки в базе")
+        
+        self.log.emit(f"📊 Колонки группировки: {gcols}")
+        
+        # Расчёт эффекта
+        self.progress.emit(40, "Вычисление эффекта индексации...")
+        
+        if charges_mode == MODE_EXTERNAL:
+            pivot = self._calc_pivot_external(df_base, df_amount, base_col, 
+                                              "MSISDN", amount_col, gcols)
+        else:
+            pivot = self._calc_pivot_inbase(df_base, base_col, current_col, gcols)
+        
+        self.log.emit(f"✅ Сформировано {len(pivot)} групп")
+        self.log.emit(f"💰 Суммарный эффект: {pivot['Эффект_тыс'].sum():.3f} тыс. руб.")
+        
+        # Применение фильтров и обновление отчёта
+        self.progress.emit(60, "Применение фильтров...")
+        
+        result = self._apply_filters_and_update(df_report, pivot, target_col, 
+                                                month, mrf_name, filters)
+        
+        self.progress.emit(80, "Подготовка к сохранению...")
+        
+        # Сохранение
+        save_path = self._save_report(df_report, target_col, result, month)
+        
+        self.progress.emit(100, "Готово!")
+        self.log.emit(f"✅ Сохранено в: {save_path}")
+        
+        # Формируем результат
+        result['save_path'] = save_path
+        result['total_effect'] = pivot['Эффект_тыс'].sum()
+        self.finished.emit(result)
+    
+    def _calc_pivot_external(self, df_base, df_amount, base_col, id_col, 
+                             amount_col, group_cols):
+        """Расчёт эффекта для режима А (отдельный файл начислений)"""
+        self.log.emit("🔄 Выполняется соединение по MSISDN...")
+        
+        df_base = df_base.copy()
+        df_amount = df_amount.copy()
+        
+        df_base[base_col] = pd.to_numeric(df_base[base_col], errors='coerce')
+        df_amount[amount_col] = pd.to_numeric(df_amount[amount_col], errors='coerce')
+        
+        df_base[id_col] = df_base[id_col].astype(str).str.strip().str.replace('.0', '', regex=False)
+        df_amount["MSISDN"] = df_amount["MSISDN"].astype(str).str.strip().str.replace('.0', '', regex=False)
+        
+        merged = df_base.merge(df_amount[["MSISDN", amount_col]], 
+                               left_on=id_col, right_on="MSISDN", how='left')
+        
+        self.log.emit(f"✅ Соединено: {len(merged):,} строк")
+        
+        merged['Эффект_руб'] = merged[amount_col] - merged[base_col]
+        merged.loc[merged['Эффект_руб'] < 0, 'Эффект_руб'] = 0
+        
+        positive = (merged['Эффект_руб'] > 0).sum()
+        self.log.emit(f"✅ С положительным эффектом: {positive:,}")
+        
+        extra_cols = [c for c in [BASE_COL_PCT, BASE_COL_SEGMENT1] if c in merged.columns]
+        agg_dict = {'Эффект_руб': 'sum'}
+        for c in extra_cols:
+            agg_dict[c] = 'first'
+        
+        pivot = merged.groupby(group_cols, as_index=False).agg(agg_dict)
+        pivot['Эффект_тыс'] = (pivot['Эффект_руб'] / 1000).round(3)
+        
+        return pivot
+    
+    def _calc_pivot_inbase(self, df_base, base_col, current_col, group_cols):
+        """Расчёт эффекта для режима В (начисления в базе)"""
+        self.log.emit("🔄 Выполняется расчёт из колонок базы...")
+        
+        df = df_base.copy()
+        df[base_col] = pd.to_numeric(df[base_col], errors='coerce')
+        df[current_col] = pd.to_numeric(df[current_col], errors='coerce')
+        
+        df['Эффект_руб'] = df[current_col] - df[base_col]
+        df.loc[df['Эффект_руб'] < 0, 'Эффект_руб'] = 0
+        
+        positive = (df['Эффект_руб'] > 0).sum()
+        self.log.emit(f"✅ С положительным эффектом: {positive:,}")
+        
+        extra_cols = [c for c in [BASE_COL_PCT, BASE_COL_SEGMENT1] if c in df.columns]
+        agg_dict = {'Эффект_руб': 'sum'}
+        for c in extra_cols:
+            agg_dict[c] = 'first'
+        
+        pivot = df.groupby(group_cols, as_index=False).agg(agg_dict)
+        pivot['Эффект_тыс'] = (pivot['Эффект_руб'] / 1000).round(3)
+        
+        return pivot
+    
+    def _apply_filters_and_update(self, df_report, pivot, target_col, 
+                                   month, mrf_name, filters):
+        """Применяет фильтры и обновляет отчёт"""
+        self.log.emit(f"🔍 Применяем фильтры...")
+        
+        selected_date = filters.get('date', '')
+        selected_segments = filters.get('segments', {})
+        
+        if not selected_date:
+            raise ValueError("Не выбрана дата индексации")
+        
+        selected_services = set()
+        for fc, fv in selected_segments.items():
+            if fc == "Услуга":
+                selected_services = set(fv)
+                break
+        
+        # Построение словаря отчёта
+        report_dict = {}
+        for idx, row in df_report.iterrows():
+            rd = norm_date(row[RPT_COL_DATE]) if RPT_COL_DATE in df_report.columns else ""
+            if rd != norm_date(selected_date):
+                continue
+            
+            svc = norm_text(row[RPT_COL_SERVICE]) if RPT_COL_SERVICE in df_report.columns else ""
+            if selected_services and svc not in selected_services:
+                continue
+            
+            mrf_ = norm_text(row[RPT_COL_MRF]) if RPT_COL_MRF in df_report.columns else ""
+            rf_ = map_rf(row[RPT_COL_RF]) if RPT_COL_RF in df_report.columns else ""
+            seg_ = norm_text(row[RPT_COL_SEGMENT]) if RPT_COL_SEGMENT in df_report.columns else ""
+            sub_ = norm_text(row[RPT_COL_SUBSEG]) if RPT_COL_SUBSEG in df_report.columns else ""
+            
+            key = (svc, mrf_, rf_, seg_, sub_)
+            if key not in report_dict:
+                report_dict[key] = []
+            report_dict[key].append(idx)
+        
+        total_rpt = sum(len(v) for v in report_dict.values())
+        self.log.emit(f"📋 Строк в отчёте по фильтрам: {total_rpt}")
+        
+        # Сопоставление
+        matched_count = 0
+        added_count = 0
+        not_found_count = 0
+        matched_indices = []
+        added_indices = []
+        not_found_indices = []
+        
+        pivot_ks = set()
+        for _, r in pivot.iterrows():
+            key = (
+                norm_text(r[BASE_COL_MRF]) if BASE_COL_MRF in r.index else "",
+                map_rf(r[BASE_COL_RF]) if BASE_COL_RF in r.index else "",
+                norm_text(r[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in r.index else "",
+                norm_text(r[BASE_COL_SUBSEG]) if BASE_COL_SUBSEG in r.index else ""
+            )
+            pivot_ks.add(key)
+        
+        # Получаем фильтры МРФ и РФ
+        filter_mrfs = set(selected_segments.get("МРФ", []))
+        filter_rfs = set(selected_segments.get("РФ", []))
+        
+        # Помечаем не найденные строки
+        for key_full, ridxs in report_dict.items():
+            key_no_svc = (key_full[1], key_full[2], key_full[3], key_full[4])
+            row_mrf = key_full[1]
+            row_rf = key_full[2]
+            
+            if filter_mrfs and row_mrf not in filter_mrfs:
+                continue
+            if filter_rfs and row_rf not in filter_rfs:
+                continue
+            
+            if key_no_svc not in pivot_ks:
+                for ridx in ridxs:
+                    try:
+                        cur = df_report.loc[ridx, target_col]
+                        if pd.isna(cur):
+                            df_report.loc[ridx, target_col] = 0
+                    except:
+                        pass
+                    not_found_indices.append(ridx)
+                    not_found_count += 1
+        
+        # Обновление и добавление строк
+        self.log.emit("🔄 Сопоставление данных...")
+        
+        for _, pr in pivot.iterrows():
+            mrf_ = norm_text(pr[BASE_COL_MRF]) if BASE_COL_MRF in pr.index else ""
+            rf_ = map_rf(pr[BASE_COL_RF]) if BASE_COL_RF in pr.index else ""
+            seg_ = norm_text(pr[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in pr.index else ""
+            sub_ = norm_text(pr[BASE_COL_SUBSEG]) if BASE_COL_SUBSEG in pr.index else ""
+            
+            # Проверка фильтров
+            ok = True
+            for fc, fv in selected_segments.items():
+                if fc == "Услуга":
+                    continue
+                elif fc == "МРФ" and mrf_ not in fv:
+                    ok = False
+                    break
+                elif fc == "РФ" and rf_ not in fv:
+                    ok = False
+                    break
+                elif fc == "Краткий Сегмент" and seg_ not in fv:
+                    ok = False
+                    break
+                elif fc == "Подсегмент" and sub_ not in fv:
+                    ok = False
+                    break
+            
+            if not ok:
+                continue
+            
+            eff = pr['Эффект_тыс']
+            found_any = False
+            
+            # Ищем совпадение
+            if total_rpt > 0:
+                for key_full, ridxs in report_dict.items():
+                    if (key_full[1], key_full[2], key_full[3], key_full[4]) == (mrf_, rf_, seg_, sub_):
+                        for ridx in ridxs:
+                            df_report.loc[ridx, target_col] = eff
+                            matched_indices.append(ridx)
+                            matched_count += 1
+                            found_any = True
+                        break
+            
+            # Если не найдено - добавляем новую строку
+            if not found_any:
+                svc_val = list(selected_services)[0] if selected_services else ""
+                new_row = self._build_new_row(df_report, pr, svc_val, selected_date, target_col, eff)
+                df_report = pd.concat([df_report, pd.DataFrame([new_row])], ignore_index=True)
+                added_indices.append(len(df_report) - 1)
+                added_count += 1
+        
+        self.log.emit(f"✅ Обновлено: {matched_count} строк")
+        self.log.emit(f"✅ Добавлено: {added_count} строк")
+        if not_found_count:
+            self.log.emit(f"⚠️ Не найдено в базе: {not_found_count} строк")
+        
+        return {
+            'matched_indices': matched_indices,
+            'added_indices': added_indices,
+            'not_found_indices': not_found_indices,
+            'matched_count': matched_count,
+            'added_count': added_count,
+            'not_found_count': not_found_count,
+            'df_report': df_report
+        }
+    
+    def _build_new_row(self, df_report, pivot_row, svc_val, selected_date, 
+                       target_col, eff_value):
+        """Строит новую строку для отчёта"""
+        new_row = {col: None for col in df_report.columns}
+        
+        # Услуга
+        if RPT_COL_SERVICE in new_row:
+            new_row[RPT_COL_SERVICE] = fmt_service(svc_val)
+        
+        # Дата
+        if RPT_COL_DATE in new_row:
+            try:
+                new_row[RPT_COL_DATE] = pd.to_datetime(selected_date, dayfirst=True).date()
+            except:
+                new_row[RPT_COL_DATE] = selected_date
+        
+        # Процент
+        if RPT_COL_PCT in new_row and BASE_COL_PCT in pivot_row.index:
+            new_row[RPT_COL_PCT] = fmt_pct(pivot_row[BASE_COL_PCT])
+        
+        # МРФ
+        if RPT_COL_MRF in new_row and BASE_COL_MRF in pivot_row.index:
+            new_row[RPT_COL_MRF] = fmt_mrf(pivot_row[BASE_COL_MRF])
+        
+        # РФ
+        if RPT_COL_RF in new_row and BASE_COL_RF in pivot_row.index:
+            new_row[RPT_COL_RF] = unmap_rf(map_rf(pivot_row[BASE_COL_RF]))
+        
+        # Краткий Сегмент
+        if RPT_COL_SEGMENT in new_row and BASE_COL_SEGMENT in pivot_row.index:
+            new_row[RPT_COL_SEGMENT] = fmt_seg(pivot_row[BASE_COL_SEGMENT])
+        
+        # Сегмент
+        if RPT_COL_SEGMENT1 in new_row and BASE_COL_SEGMENT1 in pivot_row.index:
+            new_row[RPT_COL_SEGMENT1] = fmt_seg(pivot_row[BASE_COL_SEGMENT1])
+        
+        # Подсегмент
+        if RPT_COL_SUBSEG in new_row and BASE_COL_SUBSEG in pivot_row.index:
+            new_row[RPT_COL_SUBSEG] = fmt_seg(pivot_row[BASE_COL_SUBSEG])
+        
+        # Эффект
+        if target_col in new_row:
+            new_row[target_col] = fmt_num3(eff_value)
+        
+        return new_row
+    
+    def _save_report(self, df_report, target_col, result, month):
+        """Сохраняет отчёт с форматированием"""
+        save_dir = QFileDialog.getExistingDirectory(
+            None, "Выберите папку для сохранения",
+            os.path.expanduser("~/Desktop")
+        )
+        
+        if not save_dir:
+            # Если пользователь отменил, сохраняем в ту же папку
+            save_dir = os.path.dirname(self.params['report_path'])
+        
+        default_name = f"Факт-эффект индексации {month} {datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        save_path = os.path.join(save_dir, default_name)
+        
+        self.log.emit(f"💾 Сохранение в: {save_path}")
+        
+        # Нормализация данных
+        df_report = self._normalize_report(df_report, target_col)
+        
+        # Сохранение с форматированием
+        with pd.ExcelWriter(save_path, engine='openpyxl', mode='w') as writer:
+            df_report.to_excel(writer, sheet_name=SHEET_TABLE3, index=False)
+        
+        # Применяем форматирование
+        wb = load_workbook(save_path)
+        ws = wb[SHEET_TABLE3]
+        
+        grn = PatternFill(start_color=FILL_UPDATED, end_color=FILL_UPDATED, fill_type='solid')
+        blue = PatternFill(start_color=FILL_ADDED, end_color=FILL_ADDED, fill_type='solid')
+        yel = PatternFill(start_color=FILL_NOT_FOUND, end_color=FILL_NOT_FOUND, fill_type='solid')
+        
+        cols_list = list(df_report.columns)
+        ci_target = cols_list.index(target_col) + 1 if target_col in cols_list else 1
+        
+        # Заливка
+        for ridx in result['matched_indices']:
+            ws.cell(row=ridx + 2, column=ci_target).fill = grn
+        
+        for ridx in result['added_indices']:
+            for c in range(1, len(cols_list) + 1):
+                ws.cell(row=ridx + 2, column=c).fill = blue
+        
+        for ridx in result['not_found_indices']:
+            ws.cell(row=ridx + 2, column=ci_target).fill = yel
+        
+        wb.save(save_path)
+        
+        return save_path
+    
+    def _normalize_report(self, df_report, target_col):
+        """Нормализует данные отчёта перед сохранением"""
+        df = df_report.copy()
+        
+        real_svc = find_col_name(df, RPT_COL_SERVICE)
+        real_mrf = find_col_name(df, RPT_COL_MRF)
+        real_rf = find_col_name(df, RPT_COL_RF)
+        real_date = find_col_name(df, RPT_COL_DATE)
+        real_pct = find_col_name(df, RPT_COL_PCT)
+        real_seg = find_col_name(df, RPT_COL_SEGMENT)
+        real_sub = find_col_name(df, RPT_COL_SUBSEG)
+        real_seg1 = find_col_name(df, RPT_COL_SEGMENT1)
+        real_tgt = find_col_name(df, target_col)
+        
+        if real_svc:
+            df[real_svc] = df[real_svc].apply(
+                lambda x: fmt_service(x) if pd.notna(x) and str(x).strip() != "" else x)
+        
+        if real_mrf:
+            df[real_mrf] = df[real_mrf].apply(
+                lambda x: fmt_mrf(x) if pd.notna(x) and str(x).strip() != "" else x)
+        
+        if real_rf:
+            df[real_rf] = df[real_rf].apply(
+                lambda x: fmt_title(x) if pd.notna(x) and str(x).strip() != "" else x)
+        
+        if real_date:
+            df[real_date] = df[real_date].apply(
+                lambda x: pd.to_datetime(x, dayfirst=True, errors="coerce").date()
+                if pd.notna(x) and str(x).strip() != "" else x)
+        
+        if real_pct:
+            df[real_pct] = df[real_pct].apply(
+                lambda x: fmt_pct(x) if pd.notna(x) and str(x).strip() != "" else x)
+        
+        if real_seg:
+            df[real_seg] = df[real_seg].apply(
+                lambda x: fmt_seg(x) if pd.notna(x) and str(x).strip() != "" else x)
+        
+        if real_sub:
+            df[real_sub] = df[real_sub].apply(
+                lambda x: fmt_seg(x) if pd.notna(x) and str(x).strip() != "" else x)
+        
+        if real_seg1:
+            df[real_seg1] = df[real_seg1].apply(
+                lambda x: fmt_seg(x) if pd.notna(x) and str(x).strip() != "" else x)
+        
+        if real_tgt:
+            df[real_tgt] = df[real_tgt].apply(
+                lambda x: fmt_num3(x) if pd.notna(x) and str(x).strip() != "" else x)
+        
+        return df
+
+
+# ============================================================================
+# ОСНОВНОЕ ОКНО ПРИЛОЖЕНИЯ
+# ============================================================================
+
+class MainWindow(QMainWindow):
+    """Главное окно приложения"""
+    
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Расчёт фактического эффекта от индексации")
+        self.setMinimumSize(900, 700)
+        self.setStyleSheet(self._get_stylesheet())
+        
+        self.report_path = None
+        self.base_path = None
+        self.charges_path = None
+        self.df_report = None
+        self.calculation_thread = None
+        
+        self._init_ui()
+        self._init_data()
+    
+    def _get_stylesheet(self):
+        return """
+            QMainWindow {
+                background-color: #F0F0F0;
+            }
+            QGroupBox {
+                border: 1px solid #D1D1D1;
+                border-radius: 4px;
+                margin-top: 8px;
+                padding-top: 8px;
+                background-color: white;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px 0 5px;
+                color: #0078D4;
+                font-weight: bold;
+            }
+            QPushButton {
+                background-color: #0078D4;
+                color: white;
+                border: none;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #106EBE;
+            }
+            QPushButton:pressed {
+                background-color: #005A9E;
+            }
+            QPushButton:disabled {
+                background-color: #A8C7E3;
+                color: #FFFFFF;
+            }
+            QPushButton#secondary {
+                background-color: #F3F3F3;
+                color: #1A1A1A;
+                border: 1px solid #D1D1D1;
+            }
+            QPushButton#secondary:hover {
+                background-color: #E5E5E5;
+            }
+            QPushButton#danger {
+                background-color: #C42B1C;
+            }
+            QPushButton#danger:hover {
+                background-color: #A11E12;
+            }
+            QComboBox {
+                padding: 6px 10px;
+                border: 1px solid #D1D1D1;
+                border-radius: 4px;
+                background-color: white;
+                min-width: 150px;
+            }
+            QComboBox:focus {
+                border-color: #0078D4;
+            }
+            QComboBox::drop-down {
+                border: none;
+            }
+            QLineEdit {
+                padding: 6px 10px;
+                border: 1px solid #D1D1D1;
+                border-radius: 4px;
+                background-color: white;
+            }
+            QLineEdit:focus {
+                border-color: #0078D4;
+            }
+            QCheckBox {
+                spacing: 8px;
+            }
+            QCheckBox::indicator {
+                width: 18px;
+                height: 18px;
+            }
+            QProgressBar {
+                border: 1px solid #D1D1D1;
+                border-radius: 4px;
+                text-align: center;
+                height: 24px;
+                background-color: white;
+            }
+            QProgressBar::chunk {
+                background-color: #0078D4;
+                border-radius: 3px;
+            }
+            QTextEdit {
+                border: 1px solid #D1D1D1;
+                border-radius: 4px;
+                background-color: #FAFAFA;
+                font-family: Consolas, monospace;
+                font-size: 10pt;
+            }
+            QLabel#title {
+                font-size: 16pt;
+                font-weight: bold;
+                color: #1A1A1A;
+            }
+            QLabel#hint {
+                color: #767676;
+                font-size: 9pt;
+            }
+            QTabWidget::pane {
+                border: 1px solid #D1D1D1;
+                border-radius: 4px;
+                background-color: white;
+            }
+            QTabBar::tab {
+                padding: 8px 16px;
+                background-color: #F0F0F0;
+                border: 1px solid #D1D1D1;
+                border-bottom: none;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                margin-right: 2px;
+            }
+            QTabBar::tab:selected {
+                background-color: white;
+                border-bottom: 2px solid #0078D4;
+            }
+            QTabBar::tab:hover {
+                background-color: #E5E5E5;
+            }
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+        """
+    
+    def _init_ui(self):
+        """Инициализация пользовательского интерфейса"""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        main_layout = QVBoxLayout(central_widget)
+        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(15, 15, 15, 15)
+        
+        # Заголовок
+        title = QLabel("Расчёт фактического эффекта от индексации")
+        title.setObjectName("title")
+        title.setAlignment(Qt.AlignCenter)
+        main_layout.addWidget(title)
+        
+        # Основной контент (табы)
+        tabs = QTabWidget()
+        main_layout.addWidget(tabs)
+        
+        # Вкладка: Параметры расчёта
+        params_tab = QWidget()
+        params_layout = QVBoxLayout(params_tab)
+        params_layout.setSpacing(10)
+        tabs.addTab(params_tab, "📊 Параметры")
+        
+        # Группа: Основные параметры
+        main_group = QGroupBox("Основные параметры")
+        main_layout_params = QVBoxLayout(main_group)
+        main_layout_params.setSpacing(8)
+        
+        # Строка: Месяц
+        month_row = QHBoxLayout()
+        month_row.addWidget(QLabel("Отчётный месяц:"))
+        self.month_combo = QComboBox()
+        self.month_combo.addItems(MONTHS)
+        self.month_combo.setCurrentText("апрель")
+        month_row.addWidget(self.month_combo)
+        month_row.addStretch()
+        main_layout_params.addLayout(month_row)
+        
+        # Строка: МРФ
+        mrf_row = QHBoxLayout()
+        mrf_row.addWidget(QLabel("МРФ:"))
+        self.mrf_checks = []
+        mrf_container = QWidget()
+        mrf_layout = QHBoxLayout(mrf_container)
+        mrf_layout.setContentsMargins(0, 0, 0, 0)
+        
+        mrf_scroll = QScrollArea()
+        mrf_scroll.setWidgetResizable(True)
+        mrf_scroll.setMaximumHeight(100)
+        mrf_scroll.setWidget(mrf_container)
+        mrf_row.addWidget(mrf_scroll, 1)
+        main_layout_params.addLayout(mrf_row)
+        
+        # Кнопки для МРФ
+        mrf_btn_row = QHBoxLayout()
+        self.select_all_mrf_btn = QPushButton("✓ Выбрать все")
+        self.select_all_mrf_btn.setObjectName("secondary")
+        self.select_all_mrf_btn.clicked.connect(self._select_all_mrf)
+        self.deselect_all_mrf_btn = QPushButton("✗ Снять все")
+        self.deselect_all_mrf_btn.setObjectName("secondary")
+        self.deselect_all_mrf_btn.clicked.connect(self._deselect_all_mrf)
+        mrf_btn_row.addWidget(self.select_all_mrf_btn)
+        mrf_btn_row.addWidget(self.deselect_all_mrf_btn)
+        mrf_btn_row.addStretch()
+        main_layout_params.addLayout(mrf_btn_row)
+        
+        # Строка: Отчёт
+        report_row = QHBoxLayout()
+        report_row.addWidget(QLabel("Файл отчёта:"))
+        self.report_label = QLabel("Не выбран")
+        self.report_label.setObjectName("hint")
+        report_row.addWidget(self.report_label, 1)
+        self.report_btn = QPushButton("Выбрать...")
+        self.report_btn.clicked.connect(self._select_report)
+        report_row.addWidget(self.report_btn)
+        main_layout_params.addLayout(report_row)
+        
+        # Строка: База индексации
+        base_row = QHBoxLayout()
+        base_row.addWidget(QLabel("База индексации:"))
+        self.base_label = QLabel("Не выбрана")
+        self.base_label.setObjectName("hint")
+        base_row.addWidget(self.base_label, 1)
+        self.base_btn = QPushButton("Выбрать...")
+        self.base_btn.clicked.connect(self._select_base)
+        base_row.addWidget(self.base_btn)
+        main_layout_params.addLayout(base_row)
+        
+        # Режим начислений
+        mode_group = QGroupBox("Источник начислений")
+        mode_layout = QHBoxLayout(mode_group)
+        
+        self.mode_external = QRadioButton("📄 В отдельном файле начислений")
+        self.mode_inbase = QRadioButton("📊 В этой базе индексации")
+        self.mode_external.setChecked(True)
+        
+        self.mode_group = QButtonGroup()
+        self.mode_group.addButton(self.mode_external, 0)
+        self.mode_group.addButton(self.mode_inbase, 1)
+        self.mode_group.buttonClicked.connect(self._on_mode_changed)
+        
+        mode_layout.addWidget(self.mode_external)
+        mode_layout.addWidget(self.mode_inbase)
+        mode_layout.addStretch()
+        main_layout_params.addWidget(mode_group)
+        
+        # Строка: Начисления (режим А)
+        charges_row = QHBoxLayout()
+        charges_row.addWidget(QLabel("Файл начислений:"))
+        self.charges_label = QLabel("Не выбран (режим А)")
+        self.charges_label.setObjectName("hint")
+        charges_row.addWidget(self.charges_label, 1)
+        self.charges_btn = QPushButton("Выбрать...")
+        self.charges_btn.clicked.connect(self._select_charges)
+        charges_row.addWidget(self.charges_btn)
+        main_layout_params.addLayout(charges_row)
+        
+        # Строка: Колонка "до индексации"
+        col_row = QHBoxLayout()
+        col_row.addWidget(QLabel("Колонка 'до индексации':"))
+        self.col_combo = QComboBox()
+        self.col_combo.setEditable(True)
+        self.col_combo.setMinimumWidth(200)
+        col_row.addWidget(self.col_combo)
+        col_row.addStretch()
+        main_layout_params.addLayout(col_row)
+        
+        params_layout.addWidget(main_group)
+        params_layout.addStretch()
+        
+        # Кнопка запуска
+        btn_row = QHBoxLayout()
+        self.run_btn = QPushButton("🚀 Начать расчёт")
+        self.run_btn.setMinimumHeight(40)
+        self.run_btn.clicked.connect(self._start_calculation)
+        btn_row.addStretch()
+        btn_row.addWidget(self.run_btn)
+        btn_row.addStretch()
+        params_layout.addLayout(btn_row)
+        
+        # Вкладка: Логирование
+        log_tab = QWidget()
+        log_layout = QVBoxLayout(log_tab)
+        log_layout.setSpacing(5)
+        
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(300)
+        log_layout.addWidget(QLabel("📋 Журнал выполнения:"))
+        log_layout.addWidget(self.log_text)
+        tabs.addTab(log_tab, "📋 Журнал")
+        
+        # Прогресс-бар внизу
+        progress_layout = QHBoxLayout()
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_label = QLabel("Готов к работе")
+        self.progress_label.setObjectName("hint")
+        progress_layout.addWidget(self.progress_bar, 1)
+        progress_layout.addWidget(self.progress_label)
+        main_layout.addLayout(progress_layout)
+    
+    def _init_data(self):
+        """Инициализация данных"""
+        try:
+            all_mrf = get_all_mrf()
+            mrf_container = self.sender().parent().widget() if hasattr(self, 'mrf_checks') else None
+            # Находим контейнер для МРФ
+            for i, mrf in enumerate(all_mrf):
+                cb = QCheckBox(mrf)
+                self.mrf_checks.append(cb)
+        except Exception as e:
+            self._log(f"⚠️ Ошибка загрузки справочников: {e}")
+    
+    def _select_all_mrf(self):
+        for cb in self.mrf_checks:
+            cb.setChecked(True)
+    
+    def _deselect_all_mrf(self):
+        for cb in self.mrf_checks:
+            cb.setChecked(False)
+    
+    def _select_report(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл отчёта (Таблица 3)",
+            os.path.expanduser("~/Desktop"),
+            "Excel файлы (*.xlsx);;Все файлы (*.*)"
+        )
+        if path:
+            self.report_path = path
+            self.report_label.setText(os.path.basename(path))
+            self._log(f"✅ Отчёт загружен: {path}")
+    
+    def _select_base(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл базы индексации",
+            os.path.expanduser("~/Desktop"),
+            "Excel файлы (*.xlsx);;Все файлы (*.*)"
+        )
+        if path:
+            self.base_path = path
+            self.base_label.setText(os.path.basename(path))
+            self._log(f"✅ База индексации: {path}")
+    
+    def _select_charges(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл начислений",
+            os.path.expanduser("~/Desktop"),
+            "Excel файлы (*.xlsx);;Все файлы (*.*)"
+        )
+        if path:
+            self.charges_path = path
+            self.charges_label.setText(os.path.basename(path))
+            self._log(f"✅ Начисления: {path}")
+    
+    def _on_mode_changed(self):
+        """Обработка смены режима начислений"""
+        mode = self.mode_group.checkedId()
+        if mode == 0:  # Внешний файл
+            self.charges_label.setText("Не выбран (режим А)")
+            self.charges_btn.setEnabled(True)
+        else:  # В базе
+            self.charges_label.setText("Не требуется (режим В)")
+            self.charges_btn.setEnabled(False)
+    
+    def _log(self, message):
+        """Добавляет сообщение в журнал"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.log_text.append(f"[{timestamp}] {message}")
+        # Автопрокрутка
+        cursor = self.log_text.textCursor()
+        cursor.movePosition(cursor.End)
+        self.log_text.setTextCursor(cursor)
+        QApplication.processEvents()
+    
+    def _start_calculation(self):
+        """Запуск расчёта"""
+        # Проверка входных данных
+        if not self.report_path:
+            QMessageBox.warning(self, "Ошибка", "Выберите файл отчёта!")
+            return
+        
+        if not self.base_path:
+            QMessageBox.warning(self, "Ошибка", "Выберите файл базы индексации!")
+            return
+        
+        selected_mrf = [cb.text() for cb in self.mrf_checks if cb.isChecked()]
+        if not selected_mrf:
+            QMessageBox.warning(self, "Ошибка", "Выберите хотя бы один МРФ!")
+            return
+        
+        mode = self.mode_group.checkedId()
+        charges_mode = MODE_EXTERNAL if mode == 0 else MODE_INBASE
+        
+        if charges_mode == MODE_EXTERNAL and not self.charges_path:
+            QMessageBox.warning(self, "Ошибка", "Выберите файл начислений для режима А!")
+            return
+        
+        # Проверка колонки
+        if not self.col_combo.currentText():
+            QMessageBox.warning(self, "Ошибка", "Укажите колонку 'до индексации'!")
+            return
+        
+        # Отключаем кнопку
+        self.run_btn.setEnabled(False)
+        self.run_btn.setText("⏳ Выполняется...")
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Начинаем расчёт...")
+        
+        # Формируем параметры
+        params = {
+            'month': self.month_combo.currentText(),
+            'mrf_name': selected_mrf[0],  # Пока обрабатываем один МРФ
+            'report_path': self.report_path,
+            'base_path': self.base_path,
+            'charges_mode': charges_mode,
+            'base_col': self.col_combo.currentText(),
+            'target_col': f"Эффект от индексации тыс.руб. без НДС {self.month_combo.currentText()} 2026 факт",
+            'charges_path': self.charges_path if charges_mode == MODE_EXTERNAL else None,
+            'filters': {
+                'date': f"01.01.2026",  # TODO: дату нужно будет брать из фильтров
+                'segments': {}
+            }
+        }
+        
+        # Запускаем поток
+        self.calculation_thread = CalculationThread(params)
+        self.calculation_thread.progress.connect(self._on_progress)
+        self.calculation_thread.log.connect(self._log)
+        self.calculation_thread.finished.connect(self._on_finished)
+        self.calculation_thread.error.connect(self._on_error)
+        self.calculation_thread.start()
+    
+    def _on_progress(self, value, message):
+        """Обновление прогресса"""
+        self.progress_bar.setValue(value)
+        self.progress_label.setText(message)
+        QApplication.processEvents()
+    
+    def _on_finished(self, result):
+        """Обработка завершения расчёта"""
+        self.run_btn.setEnabled(True)
+        self.run_btn.setText("🚀 Начать расчёт")
+        self.progress_label.setText("✅ Расчёт завершён!")
+        
+        self._log("=" * 60)
+        self._log("✅ РАСЧЁТ ЗАВЕРШЁН")
+        self._log(f"📊 Обновлено строк: {result['matched_count']}")
+        self._log(f"📊 Добавлено строк: {result['added_count']}")
+        if result['not_found_count']:
+            self._log(f"⚠️ Не найдено в базе: {result['not_found_count']}")
+        self._log(f"💰 Суммарный эффект: {result['total_effect']:.3f} тыс. руб.")
+        self._log(f"💾 Сохранено: {result['save_path']}")
+        self._log("=" * 60)
+        
+        QMessageBox.information(
+            self, "Расчёт завершён",
+            f"Расчёт успешно завершён!\n\n"
+            f"📊 Обновлено строк: {result['matched_count']}\n"
+            f"📊 Добавлено строк: {result['added_count']}\n"
+            f"💰 Суммарный эффект: {result['total_effect']:.3f} тыс. руб.\n\n"
+            f"💾 Сохранено: {os.path.basename(result['save_path'])}"
+        )
+    
+    def _on_error(self, error_msg):
+        """Обработка ошибки"""
+        self.run_btn.setEnabled(True)
+        self.run_btn.setText("🚀 Начать расчёт")
+        self.progress_label.setText("❌ Ошибка!")
+        self._log(f"❌ Ошибка: {error_msg}")
+        QMessageBox.critical(self, "Ошибка", f"Произошла ошибка:\n\n{error_msg}")
+
+
+# ============================================================================
+# ЗАПУСК ПРИЛОЖЕНИЯ
+# ============================================================================
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    
+    window = MainWindow()
+    window.show()
+    
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
