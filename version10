@@ -1,1 +1,1567 @@
+"""
+Расчёт фактического эффекта от индексации — v3 (IDLE-совместимая версия).
+Полностью переделанный интерфейс: одно окно, все настройки видны сразу.
+"""
+from __future__ import annotations
+import gc
+import json
+import logging
+import os
+import pathlib
+import pickle
+import re
+import sqlite3
+import sys
+import tempfile
+from collections import defaultdict
+from datetime import datetime
+from typing import Any, Callable, Optional
+import pandas as pd
+import psutil
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 
+try:
+    from PyQt5.QtWidgets import (
+        QApplication, QMainWindow, QWidget,
+        QVBoxLayout, QHBoxLayout, QGridLayout,
+        QLabel, QPushButton, QComboBox,
+        QLineEdit, QCheckBox, QScrollArea, QFrame, QGroupBox,
+        QFileDialog, QMessageBox, QTextEdit,
+        QProgressBar, QRadioButton, QButtonGroup, QSizePolicy
+    )
+    from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
+    from PyQt5.QtGui import QFont
+    PYQT_AVAILABLE = True
+except ImportError:
+    PYQT_AVAILABLE = False
+    print("❌ PyQt5 не установлен. Установите: pip install PyQt5")
+    sys.exit(1)
+
+# ── ЛОГИРОВАНИЕ ───────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+log = logging.getLogger("indexation")
+
+# ── СТИЛИ ─────────────────────────────────────────────────────
+ACCENT = "#0078D4"
+ACCENT_H = "#106EBE"
+BG = "#FFFFFF"
+BG_PANEL = "#F3F3F3"
+TEXT = "#1A1A1A"
+HINT = "#767676"
+BORDER = "#D1D1D1"
+RED = "#C42B1C"
+GREEN = "#107C10"
+
+STYLESHEET = f"""
+QWidget {{ font-family: "Segoe UI"; font-size:10pt; color:{TEXT}; background:{BG}; }}
+QPushButton {{ background:{ACCENT}; color:white; border:none; padding:8px 18px;
+border-radius:2px; font-size:10pt; }}
+QPushButton:hover {{ background:{ACCENT_H}; }}
+QPushButton:pressed {{ background:#005A9E; }}
+QPushButton:disabled{{ background:#A8C7E3; }}
+QPushButton.secondary {{ background:{BG_PANEL}; color:{TEXT};
+border:1px solid {BORDER}; }}
+QPushButton.secondary:hover{{ background:#E5E5E5; border-color:{ACCENT}; }}
+QPushButton.danger {{ background:{RED}; color:white; border:none; }}
+QPushButton.danger:hover {{ background:#A11E12; }}
+QPushButton.small {{ padding:4px 10px; font-size:9pt; }}
+QLineEdit,QComboBox {{ border:1px solid {BORDER}; border-radius:2px;
+padding:5px 8px; background:{BG}; }}
+QLineEdit:focus,QComboBox:focus {{ border-color:{ACCENT}; }}
+QLineEdit:disabled,QComboBox:disabled {{ background:{BG_PANEL}; color:{HINT}; }}
+QGroupBox {{ border:1px solid {BORDER}; border-radius:2px; margin-top:10px;
+padding-top:14px; font-size:9pt; font-weight:bold; color:{ACCENT}; }}
+QGroupBox::title {{ subcontrol-origin:margin; left:10px; padding:0 4px; }}
+QScrollBar:vertical {{ background:{BG_PANEL}; width:10px; border-radius:4px; }}
+QScrollBar::handle:vertical {{ background:{BORDER}; border-radius:4px; min-height:20px; }}
+QScrollBar::handle:vertical:hover {{ background:{ACCENT}; }}
+QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical {{ height:0; }}
+QCheckBox {{ spacing:6px; }}
+QCheckBox::indicator {{ width:16px; height:16px; border:1px solid {BORDER};
+border-radius:2px; background:{BG}; }}
+QCheckBox::indicator:checked {{ background:{ACCENT}; border-color:{ACCENT}; }}
+QCheckBox:disabled {{ color:{HINT}; }}
+QCheckBox::indicator:disabled {{ background:{BG_PANEL}; border-color:{BORDER}; }}
+QProgressBar {{ border:1px solid {BORDER}; border-radius:2px; text-align:center;
+font-size:9pt; height:18px; }}
+QProgressBar::chunk {{ background:{ACCENT}; border-radius:2px; }}
+QRadioButton {{ spacing:6px; }}
+QRadioButton::indicator {{ width:16px; height:16px; }}
+QRadioButton:disabled {{ color:{HINT}; }}
+QRadioButton::indicator:disabled {{ background:{BG_PANEL}; border-color:{BORDER}; }}
+"""
+
+def make_header(text: str) -> QLabel:
+    lbl = QLabel(text)
+    lbl.setStyleSheet(f"background:{ACCENT};color:white;font-size:13pt;"
+                      f"font-weight:bold;padding:12px 20px;")
+    lbl.setMinimumHeight(52)
+    return lbl
+
+# ── СПРАВОЧНИКИ ───────────────────────────────────────────────
+def _load_mappings() -> dict:
+    p = pathlib.Path(__file__).parent / "data" / "mappings.json"
+    if not p.exists():
+        try:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.critical(None, "Ошибка",
+                                 f"Файл справочников не найден:\n{p}\n\n"
+                                 "Положите папку data/ рядом с программой.")
+        except:
+            pass
+        return {}
+    with open(p, encoding="utf-8") as f:
+        return json.load(f)
+
+_M = _load_mappings()
+ALL_MRF = _M.get("ALL_MRF", [])
+MRF_TO_RF = _M.get("MRF_TO_RF", {})
+RF_MAPPING = _M.get("RF_MAPPING", {})
+RF_REVERSE = _M.get("RF_REVERSE", {})
+UPPERCASE_SERVICES = set(_M.get("UPPERCASE_SERVICES", []))
+SERVICE_EXACT = _M.get("SERVICE_EXACT", {})
+MRF_EXACT = _M.get("MRF_EXACT", {})
+
+# ── КОНСТАНТЫ ─────────────────────────────────────────────────
+SHEET_TABLE2: str = "Лист1"
+SHEET_TABLE1: str = "Sheet"
+SHEET_TABLE3: str = "Факт-эффект индексации 2026"
+BASE_COL_SERVICE: str = "Услуга"
+BASE_COL_DATE: str = "Дата индексации"
+BASE_COL_PCT: str = "% индексации"
+BASE_COL_MRF: str = "МРФ"
+BASE_COL_RF: str = "РФ"
+BASE_COL_SEGMENT: str = "Краткий сегмент"
+BASE_COL_SUBSEG: str = "Подсегмент"
+BASE_COL_SEGMENT1: str = "Сегмент1"
+
+RPT_COL_SERVICE: str = "Услуга"
+RPT_COL_DATE: str = "Дата индексации"
+RPT_COL_PCT: str = "Процент индексации"
+RPT_COL_MRF: str = "МРФ"
+RPT_COL_RF: str = "РФ"
+RPT_COL_SEGMENT: str = "Краткий Сегмент"
+RPT_COL_SUBSEG: str = "Подсегмент"
+RPT_COL_SEGMENT1: str = "Сегмент"
+
+TARGET_KEYWORDS = ["эффект от индексации", "факт"]
+FILL_UPDATED = "C6EFCE"
+FILL_ADDED = "DDEBF7"
+FILL_NOT_FOUND = "FFEB9C"
+MODE_EXTERNAL = "external"
+MODE_INBASE = "inbase"
+MEMORY_WARN_MB = 1_500
+
+# ── УТИЛИТЫ ───────────────────────────────────────────────────
+def find_col(df: pd.DataFrame, name: str) -> Optional[str]:
+    nl = name.strip().lower()
+    return next((c for c in df.columns if str(c).strip().lower() == nl), None)
+
+def norm_text(x: Any) -> str:
+    if pd.isna(x): return ""
+    return " ".join(str(x).replace("\xa0", " ").strip().lower().split())
+
+def norm_date(x: Any) -> str:
+    if x is None: return ""
+    try:
+        if pd.isna(x): return ""
+    except TypeError:
+        pass
+    dt = pd.to_datetime(x, errors="coerce", dayfirst=True)
+    if pd.isna(dt): return str(x).strip()
+    return dt.strftime("%d.%m.%Y")
+
+def map_rf(v: Any) -> str:
+    """
+    Нормализует название филиала для сопоставления.
+    Приводит к нижнему регистру и убирает лишние пробелы.
+    
+    Примеры:
+        "Екатеринбургский филиал" -> "екатеринбургский филиал"
+        "Филиал в тюменской и курганской областях" -> "филиал в тюменской и курганской областях"
+        "Ханты-мансийский филиал" -> "ханты-мансийский филиал"
+    """
+    if pd.isna(v) or str(v).strip() == "":
+        return ""
+    
+    s = str(v).strip()
+    # Приводим к нижнему регистру и убираем лишние пробелы
+    return " ".join(s.lower().split())
+
+def fmt_title(x: Any) -> Any:
+    if pd.isna(x) or str(x).strip() == "": return x
+    s = str(x).strip()
+    return s[0].upper() + s[1:].lower()
+
+def fmt_mrf(x: Any) -> Any:
+    if pd.isna(x) or str(x).strip() == "": return x
+    return MRF_EXACT.get(str(x).strip().lower(), fmt_title(x))
+
+def fmt_service(x: Any) -> Any:
+    if pd.isna(x) or str(x).strip() == "": return x
+    s = str(x).strip()
+    key = s.lower()
+    if key in SERVICE_EXACT: return SERVICE_EXACT[key]
+    if key in UPPERCASE_SERVICES: return s.upper()
+    return fmt_title(s)
+
+def fmt_seg(x: Any) -> Any:
+    if pd.isna(x) or str(x).strip() == "": return x
+    ABBREVS = {'мсп', 'смп', 'мрф', 'фэс', 'днк', 'ккфу', 'фу', 'ру', 'вп', 'оп', 'нк', 'топ'}
+    result = []
+    for w in str(x).strip().split():
+        if re.search(r'[a-zA-Z0-9]', w):
+            result.append(w.upper())
+        elif w.lower() in ABBREVS:
+            result.append(w.upper())
+        else:
+            result.append(w.capitalize())
+    return ' '.join(result)
+
+def fmt_pct(x: Any) -> Any:
+    try:
+        v = float(str(x).replace(",", ".").replace("%", "").strip())
+        return v / 100 if v > 1 else v
+    except (ValueError, TypeError):
+        return x
+
+def fmt_num3(x: Any) -> Any:
+    try:
+        return round(float(x), 3)
+    except (ValueError, TypeError):
+        return x
+
+def memory_mb() -> float:
+    return psutil.Process().memory_info().rss / 1024 / 1024
+
+# ── ЗАПОМИНАНИЕ ПУТЕЙ ──────────────────────────────────────────
+PATHS_FILE = pathlib.Path(__file__).parent / "last_paths.json"
+
+def load_last_paths() -> dict:
+    if PATHS_FILE.exists():
+        try:
+            with open(PATHS_FILE, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_last_paths(paths: dict) -> None:
+    try:
+        with open(PATHS_FILE, "w", encoding="utf-8") as f:
+            json.dump(paths, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+# ── SQLite ─────────────────────────────────────────────────────
+class TempDB:
+    def __init__(self, db_path: str):
+        self.path = db_path
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._init_schema()
+
+    def _init_schema(self) -> None:
+        self.conn.executescript("""
+            PRAGMA journal_mode=WAL;
+            PRAGMA synchronous=NORMAL;
+            CREATE TABLE IF NOT EXISTS pivot_results (
+                session_id TEXT, mrf_name TEXT, base_num INTEGER,
+                data_blob BLOB, created_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE TABLE IF NOT EXISTS report_updates (
+                session_id TEXT, mrf_name TEXT, base_num INTEGER,
+                row_idx INTEGER, col_name TEXT, new_value TEXT, fill_type TEXT
+            );
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                session_id TEXT PRIMARY KEY, month TEXT, chosen_mrf TEXT,
+                table3_path TEXT, target_col TEXT, completed_bases TEXT,
+                updated_at TEXT DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_pivot_session
+                ON pivot_results(session_id, mrf_name, base_num);
+            CREATE INDEX IF NOT EXISTS idx_updates_session
+                ON report_updates(session_id, mrf_name, base_num);
+        """)
+        self.conn.commit()
+
+    def save_pivot(self, session_id: str, mrf: str, base_num: int, pivot: pd.DataFrame) -> None:
+        blob = pickle.dumps(pivot, protocol=pickle.HIGHEST_PROTOCOL)
+        self.conn.execute(
+            "INSERT INTO pivot_results(session_id,mrf_name,base_num,data_blob) VALUES(?,?,?,?)",
+            (session_id, mrf, base_num, blob))
+        self.conn.commit()
+
+    def save_update(self, session_id: str, mrf: str, base_num: int,
+                    row_idx: int, col: str, value: Any, fill: str) -> None:
+        self.conn.execute(
+            "INSERT INTO report_updates(session_id,mrf_name,base_num,row_idx,col_name,new_value,fill_type) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (session_id, mrf, base_num, row_idx, col, str(value), fill))
+
+    def flush_updates(self) -> None:
+        self.conn.commit()
+
+    def load_updates(self, session_id: str) -> list:
+        return self.conn.execute(
+            "SELECT row_idx,col_name,new_value,fill_type FROM report_updates WHERE session_id=? ORDER BY row_idx",
+            (session_id,)).fetchall()
+
+    def save_checkpoint(self, session_id: str, month: str, chosen_mrf: list,
+                        table3_path: str, target_col: str, completed: list) -> None:
+        self.conn.execute("""
+            INSERT INTO checkpoints(session_id,month,chosen_mrf,table3_path,target_col,completed_bases,updated_at)
+            VALUES(?,?,?,?,?,?,datetime('now'))
+            ON CONFLICT(session_id) DO UPDATE SET
+                completed_bases=excluded.completed_bases,
+                updated_at=excluded.updated_at
+        """, (session_id, month, json.dumps(chosen_mrf, ensure_ascii=False),
+              table3_path, target_col, json.dumps(completed, ensure_ascii=False)))
+        self.conn.commit()
+
+    def close(self) -> None:
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+_temp_db: Optional[TempDB] = None
+def get_temp_db() -> TempDB:
+    global _temp_db
+    if _temp_db is None:
+        db_path = pathlib.Path(tempfile.gettempdir()) / "indexation_session.db"
+        _temp_db = TempDB(str(db_path))
+    return _temp_db
+
+# ── WORKER ─────────────────────────────────────────────────────
+class CalcWorker(QObject):
+    log_msg = pyqtSignal(str)
+    progress = pyqtSignal(int, int, str)
+    finished = pyqtSignal(dict)
+    error = pyqtSignal(str)
+
+    def __init__(self, params: dict):
+        super().__init__()
+        self.params = params
+        self._stopped = False
+
+    def stop(self) -> None:
+        self._stopped = True
+
+    def _log(self, msg: str) -> None:
+        log.info(msg)
+        self.log_msg.emit(msg)
+
+    def _check_memory(self) -> None:
+        mb = memory_mb()
+        if mb > MEMORY_WARN_MB:
+            self._log(f"⚠️ RAM: {mb:.0f} МБ — сборка мусора")
+            gc.collect()
+            self._log(f"✓ RAM: {memory_mb():.0f} МБ")
+
+    def run(self) -> None:
+        try:
+            self._run_session()
+        except Exception as e:
+            log.exception("Ошибка в CalcWorker")
+            self.error.emit(str(e))
+
+    def _run_session(self) -> None:
+        p = self.params
+        session_id = p["session_id"]
+        month = p["month"]
+        mrf_name = p["mrf_name"]
+        table3_path = p["table3_path"]
+        target_col = p["target_col"]
+        save_folder = p["save_folder"]
+        amount_col = f"Без НДС {month}"
+        bases = p["bases"]
+
+        db = get_temp_db()
+        counts = {"matched": 0, "added": 0, "not_found": 0}
+
+        self._log(f"\n{'='*55}\nСЕССИЯ {session_id}\n{'='*55}")
+        self._log(f"Месяц: {month} | МРФ: {mrf_name}")
+        self._log(f"Баз в работе: {len(bases)}")
+
+        self._log("\n⏳ Загрузка отчёта...")
+        self.progress.emit(0, 100, "Загрузка отчёта")
+        t0 = datetime.now()
+        df_report = pd.read_excel(table3_path, sheet_name=SHEET_TABLE3)
+        self._log(f"   ✓ {len(df_report):,} строк за {(datetime.now()-t0).total_seconds():.1f} сек")
+        self._check_memory()
+
+        total = len(bases)
+        for base_idx, base_cfg in enumerate(bases, 1):
+            if self._stopped:
+                break
+            base_num = base_idx
+            base_path = base_cfg["base_path"]
+            charges_mode = base_cfg["charges_mode"]
+            base_col = base_cfg["base_col"]
+            id_col = base_cfg.get("id_col")
+            current_col = base_cfg.get("current_col")
+            charges_path = base_cfg.get("charges_path")
+            selected_date = base_cfg["date"]
+            selected_services = base_cfg.get("services", [])
+
+            base_name = os.path.basename(base_path)
+            self._log(f"\n  БАЗА #{base_num}: {base_name}")
+            self._log(f"  Режим: {'📂 внешний файл' if charges_mode == MODE_EXTERNAL else '📊 в базе'}")
+            self._log(f"  Дата: {selected_date} | Услуга: {', '.join(selected_services)}")
+            self.progress.emit(base_idx - 1, total, f"База #{base_num} из {total}")
+
+            self._log("  ⏳ Загрузка базы...")
+            t = datetime.now()
+            try:
+                df_base = pd.read_excel(base_path, sheet_name=SHEET_TABLE2)
+            except Exception as e:
+                self._log(f"  ❌ Ошибка загрузки базы: {e}")
+                continue
+            self._log(f"  ✓ {len(df_base):,} строк ({(datetime.now()-t).total_seconds():.1f} сек)")
+
+            df_amount = None
+            if charges_mode == MODE_EXTERNAL:
+                if not charges_path:
+                    self._log("  ❌ Путь к файлу начислений не задан")
+                    continue
+                self._log(f"  ⏳ Загрузка начислений...")
+                t = datetime.now()
+                try:
+                    df_amount = pd.read_excel(charges_path, sheet_name=SHEET_TABLE1)
+                except Exception as e:
+                    self._log(f"  ❌ Ошибка загрузки начислений: {e}")
+                    continue
+                self._log(f"  ✓ {len(df_amount):,} строк ({(datetime.now()-t).total_seconds():.1f} сек)")
+                if amount_col not in df_amount.columns:
+                    self._log(f"  ❌ Нет колонки '{amount_col}'")
+                    continue
+                if "MSISDN" not in df_amount.columns:
+                    self._log("  ❌ Нет колонки 'MSISDN'")
+                    continue
+
+            self._log("  ⏳ Расчёт эффекта...")
+            t_calc = datetime.now()
+            try:
+                gcols = [c for c in [BASE_COL_MRF, BASE_COL_RF,
+                                     BASE_COL_SEGMENT, BASE_COL_SUBSEG,
+                                     BASE_COL_SEGMENT1] if c in df_base.columns]
+                if charges_mode == MODE_EXTERNAL:
+                    pivot = _calc_pivot_external(df_base, df_amount,
+                                                 base_col, id_col, amount_col, gcols)
+                else:
+                    pivot = _calc_pivot_inbase(df_base, base_col, current_col, gcols)
+            except Exception as e:
+                self._log(f"  ❌ Ошибка расчёта: {e}")
+                continue
+            finally:
+                del df_amount, df_base
+                gc.collect()
+
+            calc_sec = (datetime.now() - t_calc).total_seconds()
+            self._log(f"  ✓ Групп: {len(pivot)}, эффект: {pivot['Эффект_тыс'].sum():,.3f} тыс. руб. ({calc_sec:.1f} сек)")
+            self._check_memory()
+
+            db.save_pivot(session_id, mrf_name, base_num, pivot)
+
+            sel = {
+                "date": selected_date,
+                "segments": {RPT_COL_SERVICE: selected_services} if selected_services else {},
+            }
+
+            self._log("  ⏳ Сопоставление с отчётом...")
+            t_match = datetime.now()
+            upd, add, nf, df_report = _match_pivot_to_report(
+                pivot, df_report, sel, target_col, base_col,
+                session_id, mrf_name, base_num, db, self._log)
+
+            match_sec = (datetime.now() - t_match).total_seconds()
+            self._log(f"  ✓ Записано: {upd} | Добавлено: {add} | Не найдено: {nf} | ⏱ {match_sec:.1f} сек")
+
+            counts["matched"] += upd
+            counts["added"] += add
+            counts["not_found"] += nf
+
+            del pivot
+            gc.collect()
+
+        self._log("\n⏳ Финальная запись отчёта в Excel...")
+        self.progress.emit(total, total, "Сохранение результата")
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base_name = os.path.splitext(os.path.basename(table3_path))[0]
+        save_filename = f"{base_name}_результат_{timestamp}.xlsx"
+        save_path = os.path.join(save_folder, save_filename)
+
+        self._apply_updates_and_save(db, session_id, df_report, target_col, save_path)
+
+        stats = {
+            "session_id": session_id,
+            "month": month,
+            "counts": counts,
+            "save_path": save_path,
+        }
+        self.finished.emit(stats)
+
+    def _apply_updates_and_save(self, db: TempDB, session_id: str,
+                                df_report: pd.DataFrame,
+                                target_col: str, save_path: str) -> None:
+        self._log("  ⏳ Применение обновлений из SQLite...")
+        updates = db.load_updates(session_id)
+        self._log(f"  ✓ Обновлений в БД: {len(updates)}")
+
+        if target_col in df_report.columns:
+            df_report[target_col] = df_report[target_col].astype(object)
+
+        matched_rows = []
+        added_rows = []
+        nf_rows = []
+
+        for row_idx, col_name, new_value, fill_type in updates:
+            if row_idx < len(df_report):
+                try:
+                    val = float(new_value) if new_value not in ("None", "") else None
+                except ValueError:
+                    val = new_value
+                if val is not None:
+                    df_report.loc[row_idx, col_name] = val
+            if fill_type == "updated":
+                matched_rows.append(row_idx)
+            elif fill_type == "added":
+                added_rows.append(row_idx)
+            elif fill_type == "not_found":
+                nf_rows.append(row_idx)
+
+        self._log("  ⏳ Нормализация данных...")
+        for col_fn in [
+            (RPT_COL_SERVICE, fmt_service), (RPT_COL_MRF, fmt_mrf),
+            (RPT_COL_RF, fmt_title), (RPT_COL_SEGMENT, fmt_seg),
+            (RPT_COL_SUBSEG, fmt_seg), (RPT_COL_SEGMENT1, fmt_seg),
+        ]:
+            real = find_col(df_report, col_fn[0])
+            if real:
+                df_report[real] = df_report[real].apply(
+                    lambda x: col_fn[1](x) if pd.notna(x) and str(x).strip() else x)
+
+        real_date = find_col(df_report, RPT_COL_DATE)
+        if real_date:
+            df_report[real_date] = df_report[real_date].apply(
+                lambda x: pd.to_datetime(x, dayfirst=True, errors="coerce").date()
+                if pd.notna(x) and str(x).strip() else x)
+
+        real_pct = find_col(df_report, RPT_COL_PCT)
+        if real_pct:
+            df_report[real_pct] = df_report[real_pct].apply(
+                lambda x: fmt_pct(x) if pd.notna(x) and str(x).strip() else x)
+
+        real_tgt = find_col(df_report, target_col)
+        if real_tgt:
+            df_report[real_tgt] = df_report[real_tgt].apply(
+                lambda x: fmt_num3(x) if pd.notna(x) and str(x).strip() else x)
+
+        self._log("  ⏳ Запись в Excel...")
+        with pd.ExcelWriter(save_path, engine='openpyxl', mode='w') as writer:
+            df_report.to_excel(writer, sheet_name=SHEET_TABLE3, index=False)
+
+        self._log("  ⏳ Применение цветовой заливки...")
+        wb = load_workbook(save_path)
+        ws = wb[SHEET_TABLE3]
+        grn = PatternFill(start_color=FILL_UPDATED, end_color=FILL_UPDATED, fill_type='solid')
+        blue = PatternFill(start_color=FILL_ADDED, end_color=FILL_ADDED, fill_type='solid')
+        yel = PatternFill(start_color=FILL_NOT_FOUND, end_color=FILL_NOT_FOUND, fill_type='solid')
+        cols = list(df_report.columns)
+        ci_t = (cols.index(target_col) + 1) if target_col in cols else 1
+
+        FMT_MAP = {RPT_COL_DATE: "DD.MM.YYYY", RPT_COL_PCT: "0.00%", target_col: "#,##0.000"}
+        TEXT_COLS = [RPT_COL_SERVICE, RPT_COL_MRF, RPT_COL_RF,
+                     RPT_COL_SEGMENT, RPT_COL_SUBSEG, RPT_COL_SEGMENT1]
+        for rn in range(2, ws.max_row + 1):
+            for cname in TEXT_COLS:
+                if cname in cols:
+                    ws.cell(rn, cols.index(cname) + 1).number_format = "@"
+            for cname, fmt in FMT_MAP.items():
+                if cname in cols:
+                    ws.cell(rn, cols.index(cname) + 1).number_format = fmt
+
+        for ridx in set(matched_rows):
+            ws.cell(ridx + 2, ci_t).fill = grn
+        for ridx in set(added_rows):
+            for c in range(1, len(cols) + 1):
+                ws.cell(ridx + 2, c).fill = blue
+        for ridx in set(nf_rows):
+            ws.cell(ridx + 2, ci_t).fill = yel
+
+        wb.save(save_path)
+        self._log(f"  ✓ Сохранено: {os.path.basename(save_path)}")
+        self._log(f"     🟢 {len(set(matched_rows))} | 🔵 {len(set(added_rows))} | 🟡 {len(set(nf_rows))}")
+
+# ── РАСЧЁТНЫЕ ФУНКЦИИ ──────────────────────────────────────────
+def _calc_pivot_external(df_base: pd.DataFrame, df_amount: pd.DataFrame,
+                         base_col: str, id_col: str,
+                         amount_col: str, gcols: list) -> pd.DataFrame:
+    df_base = df_base.copy()
+    df_amount = df_amount.copy()
+    df_base[base_col] = pd.to_numeric(df_base[base_col], errors='coerce')
+    df_amount[amount_col] = pd.to_numeric(df_amount[amount_col], errors='coerce')
+    df_base[id_col] = df_base[id_col].astype(str).str.strip().str.replace('.0', '', regex=False)
+    df_amount["MSISDN"] = df_amount["MSISDN"].astype(str).str.strip().str.replace('.0', '', regex=False)
+    merged = df_base.merge(df_amount[["MSISDN", amount_col]],
+                           left_on=id_col, right_on="MSISDN", how='left')
+    del df_base, df_amount
+    gc.collect()
+    merged['Эффект_руб'] = (merged[amount_col] - merged[base_col]).clip(lower=0)
+    extra = [c for c in [BASE_COL_PCT, BASE_COL_SEGMENT1] if c in merged.columns]
+    agg = {'Эффект_руб': 'sum', **{c: 'first' for c in extra}}
+    pivot = merged.groupby(gcols, as_index=False).agg(agg)
+    pivot['Эффект_тыс'] = (pivot['Эффект_руб'] / 1000).round(3)
+    del merged
+    gc.collect()
+    return pivot
+
+def _calc_pivot_inbase(df_base: pd.DataFrame, base_col: str,
+                       current_col: str, gcols: list) -> pd.DataFrame:
+    df = df_base.copy()
+    df[base_col] = pd.to_numeric(df[base_col], errors='coerce')
+    df[current_col] = pd.to_numeric(df[current_col], errors='coerce')
+    df['Эффект_руб'] = (df[current_col] - df[base_col]).clip(lower=0)
+    extra = [c for c in [BASE_COL_PCT, BASE_COL_SEGMENT1] if c in df.columns]
+    agg = {'Эффект_руб': 'sum', **{c: 'first' for c in extra}}
+    pivot = df.groupby(gcols, as_index=False).agg(agg)
+    pivot['Эффект_тыс'] = (pivot['Эффект_руб'] / 1000).round(3)
+    del df
+    gc.collect()
+    return pivot
+
+def _match_pivot_to_report(pivot: pd.DataFrame, df_report: pd.DataFrame,
+                           sel: dict, target_col: str, base_col: str,
+                           session_id: str, mrf_name: str, base_num: int,
+                           db: TempDB, log_fn: Callable) -> tuple:
+    selected_date = sel.get("date", "")
+    selected_segments = sel.get("segments", {})
+    selected_services = set(selected_segments.get(RPT_COL_SERVICE, []))
+    svc_col = find_col(df_report, RPT_COL_SERVICE)
+
+    report_dict = defaultdict(list)
+    for idx, row in df_report.iterrows():
+        rd = norm_date(row[RPT_COL_DATE]) if RPT_COL_DATE in df_report.columns else ""
+        if rd != norm_date(selected_date):
+            continue
+        svc = norm_text(row[svc_col]) if svc_col else ""
+        if selected_services and svc not in selected_services:
+            continue
+        mrf_ = norm_text(row[RPT_COL_MRF]) if RPT_COL_MRF in df_report.columns else ""
+        rf_ = map_rf(row[RPT_COL_RF]) if RPT_COL_RF in df_report.columns else ""
+        seg_ = norm_text(row[RPT_COL_SEGMENT]) if RPT_COL_SEGMENT in df_report.columns else ""
+        sub_ = norm_text(row[RPT_COL_SUBSEG]) if RPT_COL_SUBSEG in df_report.columns else ""
+        report_dict[(svc, mrf_, rf_, seg_, sub_)].append(idx)
+
+    total_rpt = sum(len(v) for v in report_dict.values())
+
+    pivot_ks = set()
+    for _, r in pivot.iterrows():
+        pivot_ks.add((
+            norm_text(r[BASE_COL_MRF]) if BASE_COL_MRF in r.index else "",
+            map_rf(r[BASE_COL_RF]) if BASE_COL_RF in r.index else "",
+            norm_text(r[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in r.index else "",
+            norm_text(r[BASE_COL_SUBSEG]) if BASE_COL_SUBSEG in r.index else "",
+        ))
+
+    pct_col = find_col(df_report, RPT_COL_PCT)
+    pct_lookup = {}
+    if pct_col and total_rpt > 0:
+        for kf, ridxs in report_dict.items():
+            mk, rk = kf[1], kf[2]
+            for ridx in ridxs:
+                v = df_report.loc[ridx, pct_col]
+                if pd.notna(v) and str(v).strip() not in ("", "0", "0.0"):
+                    pct_lookup[(mk, rk)] = fmt_pct(v)
+                    break
+
+    nf_idxs = []
+    if total_rpt > 0:
+        if target_col in df_report.columns:
+            df_report[target_col] = df_report[target_col].astype(object)
+        for kf, ridxs in report_dict.items():
+            rmrf, rrf = kf[1], kf[2]
+            if (rmrf, rrf, kf[3], kf[4]) not in pivot_ks:
+                for ridx in ridxs:
+                    try:
+                        cur = df_report.loc[ridx, target_col]
+                        if pd.isna(cur):
+                            df_report.loc[ridx, target_col] = 0
+                    except (TypeError, KeyError, IndexError):
+                        pass
+                    nf_idxs.append(ridx)
+                    db.save_update(session_id, mrf_name, base_num,
+                                   ridx, target_col, 0, "not_found")
+
+    updated = added_c = 0
+    svcs_check = selected_services if selected_services else {k[0] for k in report_dict}
+    if total_rpt == 0:
+        svcs_check = set()
+
+    for _, pr in pivot.iterrows():
+        mrf_ = norm_text(pr[BASE_COL_MRF]) if BASE_COL_MRF in pr.index else ""
+        rf_ = map_rf(pr[BASE_COL_RF]) if BASE_COL_RF in pr.index else ""
+        seg_ = norm_text(pr[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in pr.index else ""
+        sub_ = norm_text(pr[BASE_COL_SUBSEG]) if BASE_COL_SUBSEG in pr.index else ""
+
+        eff = pr['Эффект_тыс']
+
+        if total_rpt > 0:
+            sc_list = list(svcs_check) if svcs_check else [None]
+            found = False
+            for svc in sc_list:
+                key = (svc, mrf_, rf_, seg_, sub_)
+                if key in report_dict:
+                    for ridx in report_dict[key]:
+                        df_report.loc[ridx, target_col] = eff
+                        db.save_update(session_id, mrf_name, base_num,
+                                       ridx, target_col, eff, "updated")
+                        updated += 1
+                    found = True
+            if not found:
+                kns = (mrf_, rf_, seg_, sub_)
+                ex = {(k[1], k[2], k[3], k[4]) for k in report_dict}
+                if kns in ex:
+                    for kf, ridxs in report_dict.items():
+                        if (kf[1], kf[2], kf[3], kf[4]) == kns:
+                            for ridx in ridxs:
+                                df_report.loc[ridx, target_col] = eff
+                                db.save_update(session_id, mrf_name, base_num,
+                                               ridx, target_col, eff, "updated")
+                                updated += 1
+                            found = True
+                            break
+            if not found:
+                svc_v = list(svcs_check)[0] if svcs_check else ""
+                new_row = _build_row(df_report, pr, svc_v, selected_date,
+                                     target_col, eff, pct_lookup)
+                df_report = pd.concat([df_report, pd.DataFrame([new_row])],
+                                      ignore_index=True)
+                ridx = len(df_report) - 1
+                db.save_update(session_id, mrf_name, base_num,
+                               ridx, target_col, eff, "added")
+                added_c += 1
+        else:
+            svc_v = (str(pr[BASE_COL_SERVICE]).strip()
+                     if BASE_COL_SERVICE in pr.index and pd.notna(pr[BASE_COL_SERVICE])
+                     else (list(selected_services)[0] if selected_services else ""))
+            new_row = _build_row(df_report, pr, svc_v, selected_date,
+                                 target_col, eff, pct_lookup)
+            df_report = pd.concat([df_report, pd.DataFrame([new_row])],
+                                  ignore_index=True)
+            ridx = len(df_report) - 1
+            db.save_update(session_id, mrf_name, base_num,
+                           ridx, target_col, eff, "added")
+            added_c += 1
+
+    db.flush_updates()
+    return updated, added_c, len(nf_idxs), df_report
+
+def _build_row(df_report: pd.DataFrame, pivot_row: pd.Series,
+               svc_val: str, selected_date: str, target_col: str,
+               eff: float, pct_lookup: Optional[dict]) -> dict:
+    row = {col: None for col in df_report.columns}
+    if RPT_COL_SERVICE in row:
+        row[RPT_COL_SERVICE] = fmt_service(svc_val)
+    if RPT_COL_DATE in row:
+        try:
+            row[RPT_COL_DATE] = pd.to_datetime(selected_date, dayfirst=True).date()
+        except (ValueError, TypeError, OverflowError):
+            row[RPT_COL_DATE] = selected_date
+    if RPT_COL_PCT in row:
+        pct = None
+        if pct_lookup:
+            mk = norm_text(pivot_row[BASE_COL_MRF]) if BASE_COL_MRF in pivot_row.index else ""
+            rk = map_rf(pivot_row[BASE_COL_RF]) if BASE_COL_RF in pivot_row.index else ""
+            pct = pct_lookup.get((mk, rk))
+        if pct is None and BASE_COL_PCT in pivot_row.index:
+            pct = fmt_pct(pivot_row[BASE_COL_PCT])
+        if pct is not None:
+            row[RPT_COL_PCT] = pct
+    if RPT_COL_MRF in row and BASE_COL_MRF in pivot_row.index:
+        row[RPT_COL_MRF] = fmt_mrf(pivot_row[BASE_COL_MRF])
+    if RPT_COL_RF in row and BASE_COL_RF in pivot_row.index:
+        # Записываем название филиала как есть (в формате таблицы 3)
+        row[RPT_COL_RF] = str(pivot_row[BASE_COL_RF]).strip()
+    if RPT_COL_SEGMENT in row and BASE_COL_SEGMENT in pivot_row.index:
+        row[RPT_COL_SEGMENT] = fmt_seg(pivot_row[BASE_COL_SEGMENT])
+    if RPT_COL_SEGMENT1 in row and BASE_COL_SEGMENT1 in pivot_row.index:
+        row[RPT_COL_SEGMENT1] = fmt_seg(pivot_row[BASE_COL_SEGMENT1])
+    if RPT_COL_SUBSEG in row and BASE_COL_SUBSEG in pivot_row.index:
+        row[RPT_COL_SUBSEG] = fmt_seg(pivot_row[BASE_COL_SUBSEG])
+    if target_col in row:
+        row[target_col] = fmt_num3(eff)
+    return row
+
+# ── WIDGET БАЗЫ ────────────────────────────────────────────────
+class BaseWidget(QFrame):
+    deleted = pyqtSignal(object)
+
+    def __init__(self, base_num: int, dates: list, mode: str, parent=None):
+        super().__init__(parent)
+        self.base_num = base_num
+        self._dates = dates
+        self._mode = mode
+        self._last_paths = load_last_paths()
+        self._init_ui()
+
+    def _init_ui(self):
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet(f"BaseWidget{{background:{BG_PANEL};border:1px solid {BORDER};border-radius:4px;}}")
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+
+        # Заголовок
+        header = QHBoxLayout()
+        lbl = QLabel(f"<b>База #{self.base_num}</b>")
+        lbl.setStyleSheet("font-size:11pt;")
+        header.addWidget(lbl)
+        header.addStretch()
+        self._del_btn = QPushButton("✕ Удалить")
+        self._del_btn.setFixedWidth(90)
+        self._del_btn.setStyleSheet(
+            f"QPushButton{{background:{RED};color:white;border:none;padding:4px 10px;border-radius:2px;}}"
+            f"QPushButton:hover{{background:#A11E12;}}")
+        self._del_btn.clicked.connect(lambda: self.deleted.emit(self))
+        header.addWidget(self._del_btn)
+        layout.addLayout(header)
+
+        # Сетка параметров
+        grid = QGridLayout()
+        grid.setSpacing(6)
+
+        grid.addWidget(QLabel("Файл базы:"), 0, 0)
+        self._base_path = QLineEdit()
+        self._base_path.setReadOnly(True)
+        self._base_path.setPlaceholderText("не выбран")
+        grid.addWidget(self._base_path, 0, 1)
+        self._base_btn = QPushButton("...")
+        self._base_btn.setFixedWidth(40)
+        self._base_btn.clicked.connect(self._select_base)
+        grid.addWidget(self._base_btn, 0, 2)
+
+        grid.addWidget(QLabel("Дата индексации:"), 1, 0)
+        self._date_combo = QComboBox()
+        self._date_combo.addItems(self._dates)
+        grid.addWidget(self._date_combo, 1, 1, 1, 2)
+
+        grid.addWidget(QLabel("Колонка ДО индексации:"), 2, 0)
+        self._base_col_combo = QComboBox()
+        grid.addWidget(self._base_col_combo, 2, 1, 1, 2)
+
+        # MSISDN (для external)
+        self._msisdn_label = QLabel("Колонка MSISDN:")
+        grid.addWidget(self._msisdn_label, 3, 0)
+        self._msisdn_combo = QComboBox()
+        grid.addWidget(self._msisdn_combo, 3, 1, 1, 2)
+
+        # Текущее начисление (для inbase)
+        self._current_label = QLabel("Текущее начисление:")
+        grid.addWidget(self._current_label, 4, 0)
+        self._current_combo = QComboBox()
+        grid.addWidget(self._current_combo, 4, 1, 1, 2)
+
+        layout.addLayout(grid)
+        self._apply_mode()
+
+    def _apply_mode(self):
+        if self._mode == MODE_EXTERNAL:
+            self._msisdn_label.show()
+            self._msisdn_combo.show()
+            self._current_label.hide()
+            self._current_combo.hide()
+        else:
+            self._msisdn_label.hide()
+            self._msisdn_combo.hide()
+            self._current_label.show()
+            self._current_combo.show()
+
+    def set_mode(self, mode: str):
+        self._mode = mode
+        self._apply_mode()
+
+    def _select_base(self):
+        start_dir = self._last_paths.get("base_dir", os.path.expanduser("~/Desktop"))
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"База #{self.base_num}", start_dir,
+            "Excel files (*.xlsx);;All files (*.*)")
+        if not path:
+            return
+        self._base_path.setText(path)
+        self._last_paths["base_dir"] = os.path.dirname(path)
+        save_last_paths(self._last_paths)
+        self._load_columns(path)
+
+    def _load_columns(self, path: str):
+        try:
+            df = pd.read_excel(path, sheet_name=SHEET_TABLE2, nrows=5)
+            cols = list(df.columns)
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не могу прочитать базу:\n{e}")
+            return
+
+        self._base_col_combo.clear()
+        self._base_col_combo.addItems(cols)
+        self._msisdn_combo.clear()
+        self._msisdn_combo.addItems(cols)
+        self._current_combo.clear()
+        self._current_combo.addItems(cols)
+
+        # Автовыбор колонки ДО
+        for c in cols:
+            if "до" in str(c).lower() or "base" in str(c).lower():
+                self._base_col_combo.setCurrentText(c)
+                break
+
+        # Автовыбор MSISDN
+        possible = ["MSISDN", "Уникальный идентификационный номер услуги (ШПД, VPN - логин порта)",
+                    "Уникальный идентификационный номер услуги", "MSISDN/Логин"]
+        for p in possible:
+            if p in cols:
+                self._msisdn_combo.setCurrentText(p)
+                break
+
+    def get_data(self) -> Optional[dict]:
+        base_path = self._base_path.text()
+        if not base_path:
+            QMessageBox.warning(self, "Внимание", f"База #{self.base_num}: не выбран файл")
+            return None
+        data = {
+            "base_path": base_path,
+            "date": self._date_combo.currentText(),
+            "base_col": self._base_col_combo.currentText(),
+            "charges_mode": self._mode,
+            "id_col": None,
+            "current_col": None,
+            "services": [],
+        }
+        if self._mode == MODE_EXTERNAL:
+            data["id_col"] = self._msisdn_combo.currentText()
+        else:
+            data["current_col"] = self._current_combo.currentText()
+        return data
+    
+    def set_enabled(self, enabled: bool):
+        """Блокировка/разблокировка всех элементов управления в виджете."""
+        self._date_combo.setEnabled(enabled)
+        self._base_col_combo.setEnabled(enabled)
+        self._msisdn_combo.setEnabled(enabled)
+        self._current_combo.setEnabled(enabled)
+        self._base_btn.setEnabled(enabled)
+        self._base_path.setEnabled(enabled)
+        self._del_btn.setEnabled(enabled)
+
+# ── ГЛАВНОЕ ОКНО ───────────────────────────────────────────────
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Расчёт эффекта индексации v3")
+        self.resize(950, 850)
+        self.setStyleSheet(STYLESHEET)
+        self._worker: Optional[CalcWorker] = None
+        self._thread: Optional[QThread] = None
+        self._bases: list[BaseWidget] = []
+        self._base_counter = 0
+        self._report_dates: list[str] = []
+        self._report_services: list[str] = []
+        self._report_columns: list[str] = []
+        self._target_col: Optional[str] = None
+        self._last_paths = load_last_paths()
+        self._charges_cache: dict[str, pd.DataFrame] = {}
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+
+        main_layout.addWidget(make_header("Расчёт фактического эффекта от индексации v3"))
+
+        # Скроллируемая область с настройками
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+        scroll_layout.setContentsMargins(14, 14, 14, 14)
+        scroll_layout.setSpacing(10)
+
+        # ── Группа: Параметры отчёта ──
+        grp_report = QGroupBox("Параметры отчёта")
+        grp_report_layout = QGridLayout(grp_report)
+
+        grp_report_layout.addWidget(QLabel("Месяц отчёта:"), 0, 0)
+        self._month_combo = QComboBox()
+        self._month_combo.addItems(["январь", "февраль", "март", "апрель", "май", "июнь",
+                                    "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"])
+        self._month_combo.setCurrentIndex(5)  # июнь
+        grp_report_layout.addWidget(self._month_combo, 0, 1)
+
+        grp_report_layout.addWidget(QLabel("Файл отчёта (Таблица 3):"), 1, 0)
+        self._report_path = QLineEdit()
+        self._report_path.setReadOnly(True)
+        self._report_path.setPlaceholderText("не выбран")
+        grp_report_layout.addWidget(self._report_path, 1, 1)
+        self._report_btn = QPushButton("...")
+        self._report_btn.setFixedWidth(40)
+        self._report_btn.clicked.connect(self._select_report)
+        grp_report_layout.addWidget(self._report_btn, 1, 2)
+
+        grp_report_layout.addWidget(QLabel("Услуга:"), 2, 0)
+        self._service_combo = QComboBox()
+        self._service_combo.setEnabled(False)
+        self._service_combo.setPlaceholderText("сначала выберите отчёт")
+        grp_report_layout.addWidget(self._service_combo, 2, 1, 1, 2)
+
+        scroll_layout.addWidget(grp_report)
+
+        # ── Группа: МРФ и РФ ──
+        grp_mrf = QGroupBox("МРФ и региональные филиалы")
+        grp_mrf_layout = QVBoxLayout(grp_mrf)
+
+        mrf_row = QHBoxLayout()
+        mrf_row.addWidget(QLabel("Выберите МРФ:"))
+        self._mrf_combo = QComboBox()
+        self._mrf_combo.addItems(sorted(ALL_MRF))
+        self._mrf_combo.currentTextChanged.connect(self._on_mrf_changed)
+        mrf_row.addWidget(self._mrf_combo)
+        grp_mrf_layout.addLayout(mrf_row)
+
+        self._rf_container = QWidget()
+        self._rf_layout = QVBoxLayout(self._rf_container)
+        self._rf_layout.setContentsMargins(20, 4, 0, 0)
+        self._rf_layout.setSpacing(2)
+        self._rf_checkboxes: list[QCheckBox] = []
+        grp_mrf_layout.addWidget(self._rf_container)
+
+        if ALL_MRF:
+            self._on_mrf_changed(self._mrf_combo.currentText())
+
+        scroll_layout.addWidget(grp_mrf)
+
+        # ── Группа: Режим начислений ──
+        grp_mode = QGroupBox("Режим начислений (для выбранного МРФ)")
+        grp_mode_layout = QVBoxLayout(grp_mode)
+
+        self._mode_group = QButtonGroup()
+        self._mode_external = QRadioButton("📂 Начисления в отдельном файле")
+        self._mode_inbase = QRadioButton("📊 Начисления в самой базе индексации")
+        self._mode_external.setChecked(True)
+        self._mode_group.addButton(self._mode_external)
+        self._mode_group.addButton(self._mode_inbase)
+        grp_mode_layout.addWidget(self._mode_external)
+        grp_mode_layout.addWidget(self._mode_inbase)
+
+        self._charges_widget = QWidget()
+        charges_row = QHBoxLayout(self._charges_widget)
+        charges_row.setContentsMargins(20, 4, 0, 0)
+        charges_row.addWidget(QLabel("Файл начислений:"))
+        self._charges_path = QLineEdit()
+        self._charges_path.setReadOnly(True)
+        self._charges_path.setPlaceholderText("не выбран")
+        charges_row.addWidget(self._charges_path)
+        self._charges_btn = QPushButton("...")
+        self._charges_btn.setFixedWidth(40)
+        self._charges_btn.clicked.connect(self._select_charges)
+        charges_row.addWidget(self._charges_btn)
+        grp_mode_layout.addWidget(self._charges_widget)
+
+        self._mode_external.toggled.connect(self._on_mode_changed)
+        self._on_mode_changed()
+
+        scroll_layout.addWidget(grp_mode)
+
+        # ── Группа: Базы индексации ──
+        grp_bases = QGroupBox("Базы индексации")
+        grp_bases_layout = QVBoxLayout(grp_bases)
+
+        self._bases_container = QWidget()
+        self._bases_layout = QVBoxLayout(self._bases_container)
+        self._bases_layout.setContentsMargins(0, 0, 0, 0)
+        self._bases_layout.setSpacing(8)
+        grp_bases_layout.addWidget(self._bases_container)
+
+        add_row = QHBoxLayout()
+        self._add_base_btn = QPushButton("+ Добавить базу")
+        self._add_base_btn.clicked.connect(self._add_base)
+        add_row.addWidget(self._add_base_btn)
+        add_row.addStretch()
+        self._base_count_lbl = QLabel("Баз добавлено: 0")
+        self._base_count_lbl.setStyleSheet(f"color:{HINT};")
+        add_row.addWidget(self._base_count_lbl)
+        grp_bases_layout.addLayout(add_row)
+
+        scroll_layout.addWidget(grp_bases)
+
+        # ── Группа: Сохранение ──
+        grp_save = QGroupBox("Сохранение результата")
+        grp_save_layout = QHBoxLayout(grp_save)
+        grp_save_layout.addWidget(QLabel("Папка для сохранения:"))
+        self._save_folder = QLineEdit()
+        self._save_folder.setReadOnly(True)
+        self._save_folder.setPlaceholderText("не выбрана")
+        grp_save_layout.addWidget(self._save_folder)
+        self._save_btn = QPushButton("...")
+        self._save_btn.setFixedWidth(40)
+        self._save_btn.clicked.connect(self._select_save_folder)
+        grp_save_layout.addWidget(self._save_btn)
+
+        scroll_layout.addWidget(grp_save)
+
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_widget)
+        main_layout.addWidget(scroll, 1)
+
+        # ── Нижняя панель: прогресс + консоль + кнопки ──
+        bottom = QWidget()
+        bottom_layout = QVBoxLayout(bottom)
+        bottom_layout.setContentsMargins(12, 6, 12, 6)
+        bottom_layout.setSpacing(4)
+
+        # Прогресс-бар загрузки
+        self._load_progress = QProgressBar()
+        self._load_progress.setFixedHeight(16)
+        self._load_progress.setValue(0)
+        self._load_progress.setFormat("Загрузка файлов: %v / %m")
+        bottom_layout.addWidget(self._load_progress)
+
+        # Прогресс-бар расчёта
+        self._calc_progress = QProgressBar()
+        self._calc_progress.setFixedHeight(16)
+        self._calc_progress.setValue(0)
+        self._calc_progress.setFormat("Расчёт: %v / %m баз")
+        bottom_layout.addWidget(self._calc_progress)
+
+        # Консоль
+        self._console = QTextEdit()
+        self._console.setReadOnly(True)
+        self._console.setMaximumHeight(140)
+        self._console.setStyleSheet(
+            "font-family:Consolas;font-size:9pt;background:#FAFAFA;border:1px solid #E0E0E0;")
+        bottom_layout.addWidget(self._console)
+
+        # Кнопки
+        btn_row = QHBoxLayout()
+        self._run_btn = QPushButton("▶ Рассчитать")
+        self._run_btn.setStyleSheet(
+            f"QPushButton{{background:{GREEN};color:white;padding:10px 30px;font-size:11pt;font-weight:bold;}}"
+            f"QPushButton:hover{{background:#0B6A0B;}}")
+        self._run_btn.clicked.connect(self._start_calc)
+        self._stop_btn = QPushButton("■ Стоп")
+        self._stop_btn.setEnabled(False)
+        self._stop_btn.setStyleSheet(
+            f"QPushButton{{background:{RED};color:white;padding:10px 20px;}}"
+            f"QPushButton:disabled{{background:#E0A0A0;}}")
+        self._stop_btn.clicked.connect(self._stop_calc)
+        btn_row.addWidget(self._run_btn)
+        btn_row.addWidget(self._stop_btn)
+        btn_row.addStretch()
+
+        self._mem_lbl = QLabel("RAM: — МБ")
+        self._mem_lbl.setStyleSheet(f"color:{HINT};font-size:9pt;")
+        btn_row.addWidget(self._mem_lbl)
+        bottom_layout.addLayout(btn_row)
+
+        main_layout.addWidget(bottom)
+
+        # Таймер памяти
+        self._mem_timer = QTimer(self)
+        self._mem_timer.timeout.connect(self._update_mem)
+        self._mem_timer.start(2000)
+
+        # Восстановление путей
+        if self._last_paths.get("save_folder"):
+            self._save_folder.setText(self._last_paths["save_folder"])
+        if self._last_paths.get("report_path") and os.path.exists(self._last_paths["report_path"]):
+            self._report_path.setText(self._last_paths["report_path"])
+            QTimer.singleShot(100, lambda: self._load_report_data(self._last_paths["report_path"]))
+        if self._last_paths.get("charges_path"):
+            self._charges_path.setText(self._last_paths["charges_path"])
+
+        self.show()
+
+    def _update_mem(self) -> None:
+        mb = int(memory_mb())
+        self._mem_lbl.setText(f"RAM: {mb} МБ")
+        color = RED if mb > MEMORY_WARN_MB else (
+            "#E8A000" if mb > MEMORY_WARN_MB * 0.7 else ACCENT)
+        self._mem_lbl.setStyleSheet(f"color:{color};font-size:9pt;")
+
+    def _select_report(self):
+        start_dir = self._last_paths.get("report_dir", os.path.expanduser("~/Desktop"))
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Выберите файл отчёта (Таблица 3)", start_dir,
+            "Excel files (*.xlsx);;All files (*.*)")
+        if not path:
+            return
+        self._report_path.setText(path)
+        self._last_paths["report_dir"] = os.path.dirname(path)
+        self._last_paths["report_path"] = path
+        save_last_paths(self._last_paths)
+        self._load_report_data(path)
+
+    def _load_report_data(self, path: str):
+        """Загружает даты, услуги и колонки из отчёта."""
+        self.log(f"⏳ Чтение отчёта: {os.path.basename(path)}")
+        self._load_progress.setMaximum(3)
+        self._load_progress.setValue(0)
+        QApplication.processEvents()
+
+        try:
+            # Даты
+            df_dates = pd.read_excel(path, sheet_name=SHEET_TABLE3, usecols=[RPT_COL_DATE])
+            raw_dates = df_dates[RPT_COL_DATE].dropna().unique()
+            self._report_dates = sorted(
+                set(norm_date(d) for d in raw_dates if norm_date(d)),
+                key=lambda d: pd.to_datetime(d, dayfirst=True, errors="coerce"))
+            self._load_progress.setValue(1)
+            QApplication.processEvents()
+
+            # Услуги
+            df_svc = pd.read_excel(path, sheet_name=SHEET_TABLE3, usecols=[RPT_COL_SERVICE])
+            raw_svcs = df_svc[RPT_COL_SERVICE].dropna().unique()
+            self._report_services = sorted(set(str(s).strip() for s in raw_svcs if str(s).strip()))
+            self._load_progress.setValue(2)
+            QApplication.processEvents()
+
+            # Колонки + целевая
+            df_head = pd.read_excel(path, sheet_name=SHEET_TABLE3, nrows=0)
+            self._report_columns = list(df_head.columns)
+
+            month = self._month_combo.currentText()
+            self._target_col = None
+            for col in self._report_columns:
+                cs = str(col).lower()
+                if month in cs and all(kw in cs for kw in TARGET_KEYWORDS):
+                    self._target_col = col
+                    break
+
+            self._load_progress.setValue(3)
+            QApplication.processEvents()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", f"Не могу прочитать отчёт:\n{e}")
+            self._report_dates = []
+            self._report_services = []
+            return
+
+        # Заполняем dropdown услуг
+        self._service_combo.clear()
+        self._service_combo.addItems(self._report_services)
+        self._service_combo.setEnabled(True)
+
+        # Обновляем даты во всех существующих базах
+        for bw in self._bases:
+            bw._dates = self._report_dates
+            current = bw._date_combo.currentText()
+            bw._date_combo.clear()
+            bw._date_combo.addItems(self._report_dates)
+            if current in self._report_dates:
+                bw._date_combo.setCurrentText(current)
+
+        msg = f"✓ Отчёт загружен: {len(self._report_dates)} дат, {len(self._report_services)} услуг"
+        if self._target_col:
+            msg += f"\n  Целевая колонка: {self._target_col}"
+        else:
+            msg += f"\n  ⚠️ Целевая колонка для '{month}' не найдена"
+        self.log(msg)
+
+    def _on_mrf_changed(self, mrf: str):
+        """При смене МРФ — перерисовываем чекбоксы РФ."""
+        # Очищаем старые
+        for cb in self._rf_checkboxes:
+            self._rf_layout.removeWidget(cb)
+            cb.deleteLater()
+        self._rf_checkboxes.clear()
+
+        if not mrf:
+            return
+
+        # Получаем список РФ для этого МРФ
+        rf_list = MRF_TO_RF.get(mrf, [])
+        if not rf_list:
+            lbl = QLabel(f"<i>Для МРФ {mrf} не найдены региональные филиалы</i>")
+            lbl.setStyleSheet(f"color:{HINT};")
+            self._rf_layout.addWidget(lbl)
+            self._rf_checkboxes.append(lbl)
+            return
+
+        # Все галочки включены по умолчанию
+        for rf in rf_list:
+            cb = QCheckBox(rf)
+            cb.setChecked(True)
+            self._rf_layout.addWidget(cb)
+            self._rf_checkboxes.append(cb)
+
+    def _on_mode_changed(self):
+        if self._mode_external.isChecked():
+            self._charges_widget.show()
+        else:
+            self._charges_widget.hide()
+        # Обновляем режим во всех базах
+        mode = MODE_EXTERNAL if self._mode_external.isChecked() else MODE_INBASE
+        for bw in self._bases:
+            bw.set_mode(mode)
+
+    def _select_charges(self):
+        start_dir = self._last_paths.get("charges_dir", os.path.expanduser("~/Desktop"))
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Файл начислений", start_dir,
+            "Excel files (*.xlsx);;All files (*.*)")
+        if not path:
+            return
+        self._charges_path.setText(path)
+        self._last_paths["charges_dir"] = os.path.dirname(path)
+        self._last_paths["charges_path"] = path
+        save_last_paths(self._last_paths)
+
+    def _add_base(self):
+        if not self._report_dates:
+            QMessageBox.warning(self, "Внимание",
+                                "Сначала выберите файл отчёта — из него берутся даты.")
+            return
+
+        self._base_counter += 1
+        mode = MODE_EXTERNAL if self._mode_external.isChecked() else MODE_INBASE
+        bw = BaseWidget(self._base_counter, self._report_dates, mode)
+        bw.deleted.connect(self._remove_base)
+        self._bases.append(bw)
+        self._bases_layout.addWidget(bw)
+        self._base_count_lbl.setText(f"Баз добавлено: {len(self._bases)}")
+
+    def _remove_base(self, bw: BaseWidget):
+        if bw in self._bases:
+            self._bases.remove(bw)
+            self._bases_layout.removeWidget(bw)
+            bw.deleteLater()
+            self._base_count_lbl.setText(f"Баз добавлено: {len(self._bases)}")
+
+    def _select_save_folder(self):
+        start_dir = self._last_paths.get("save_folder", os.path.expanduser("~/Desktop"))
+        folder = QFileDialog.getExistingDirectory(self, "Папка для сохранения", start_dir)
+        if not folder:
+            return
+        self._save_folder.setText(folder)
+        self._last_paths["save_folder"] = folder
+        save_last_paths(self._last_paths)
+
+    def log(self, msg: str) -> None:
+        self._console.append(msg)
+        # Автопрокрутка
+        sb = self._console.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _set_controls_enabled(self, enabled: bool):
+        """Блокировка/разблокировка всех элементов управления."""
+        # Параметры отчёта
+        self._month_combo.setEnabled(enabled)
+        self._report_path.setEnabled(enabled)
+        self._report_btn.setEnabled(enabled)
+        self._service_combo.setEnabled(enabled)
+        
+        # МРФ
+        self._mrf_combo.setEnabled(enabled)
+        
+        # Режим начислений
+        self._mode_external.setEnabled(enabled)
+        self._mode_inbase.setEnabled(enabled)
+        self._charges_path.setEnabled(enabled)
+        self._charges_btn.setEnabled(enabled)
+        
+        # Добавление баз
+        self._add_base_btn.setEnabled(enabled)
+        
+        # Сохранение
+        self._save_folder.setEnabled(enabled)
+        self._save_btn.setEnabled(enabled)
+        
+        # Чекбоксы РФ
+        for cb in self._rf_checkboxes:
+            if isinstance(cb, QCheckBox):
+                cb.setEnabled(enabled)
+        
+        # Все виджеты баз
+        for bw in self._bases:
+            bw.set_enabled(enabled)
+
+    def _start_calc(self):
+        """Валидация и запуск расчёта."""
+        # Валидация
+        report_path = self._report_path.text()
+        if not report_path or not os.path.exists(report_path):
+            QMessageBox.warning(self, "Внимание", "Выберите файл отчёта.")
+            return
+
+        if not self._target_col:
+            QMessageBox.warning(self, "Внимание",
+                                f"Целевая колонка для месяца '{self._month_combo.currentText()}' не найдена.")
+            return
+
+        service = self._service_combo.currentText()
+        if not service:
+            QMessageBox.warning(self, "Внимание", "Выберите услугу.")
+            return
+
+        mrf = self._mrf_combo.currentText()
+        if not mrf:
+            QMessageBox.warning(self, "Внимание", "Выберите МРФ.")
+            return
+
+        if not self._bases:
+            QMessageBox.warning(self, "Внимание", "Добавьте хотя бы одну базу.")
+            return
+
+        save_folder = self._save_folder.text()
+        if not save_folder or not os.path.isdir(save_folder):
+            QMessageBox.warning(self, "Внимание", "Выберите папку для сохранения.")
+            return
+
+        mode = MODE_EXTERNAL if self._mode_external.isChecked() else MODE_INBASE
+        charges_path = self._charges_path.text() if mode == MODE_EXTERNAL else None
+        if mode == MODE_EXTERNAL and (not charges_path or not os.path.exists(charges_path)):
+            QMessageBox.warning(self, "Внимание", "Выберите файл начислений.")
+            return
+
+        # Собираем параметры баз
+        bases = []
+        for bw in self._bases:
+            data = bw.get_data()
+            if data is None:
+                return
+            data["charges_mode"] = mode
+            data["charges_path"] = charges_path
+            data["services"] = [norm_text(service)]
+            bases.append(data)
+
+        # Подтверждение
+        msg = (f"Запустить расчёт?\n\n"
+               f"Месяц: {self._month_combo.currentText()}\n"
+               f"МРФ: {mrf}\n"
+               f"Услуга: {service}\n"
+               f"Режим: {'внешний файл' if mode == MODE_EXTERNAL else 'в базе'}\n"
+               f"Баз: {len(bases)}\n"
+               f"Сохранение: {save_folder}")
+        if QMessageBox.question(self, "Подтверждение", msg,
+                                QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        params = {
+            "session_id": datetime.now().strftime("%Y%m%d_%H%M%S"),
+            "month": self._month_combo.currentText(),
+            "mrf_name": mrf,
+            "table3_path": report_path,
+            "target_col": self._target_col,
+            "save_folder": save_folder,
+            "bases": bases,
+        }
+
+        self._run_worker(params)
+
+    def _run_worker(self, params: dict):
+        # Блокируем все элементы управления
+        self._set_controls_enabled(False)
+        
+        self._run_btn.setEnabled(False)
+        self._stop_btn.setEnabled(True)
+        self._calc_progress.setMaximum(max(len(params["bases"]), 1))
+        self._calc_progress.setValue(0)
+        self._console.clear()
+
+        self._thread = QThread()
+        self._worker = CalcWorker(params)
+        self._worker.moveToThread(self._thread)
+
+        self._thread.started.connect(self._worker.run)
+        self._worker.log_msg.connect(self.log)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.error.connect(self._on_error)
+
+        self._thread.start()
+
+    def _stop_calc(self):
+        if self._worker:
+            self._worker.stop()
+            self.log("\n⚠️ Остановка после текущей операции...")
+
+    def _on_progress(self, cur: int, total: int, desc: str):
+        self._calc_progress.setMaximum(total)
+        self._calc_progress.setValue(cur)
+        self._calc_progress.setFormat(f"{desc} ({cur}/{total})")
+
+    def _on_finished(self, stats: dict):
+        self._cleanup_thread()
+        # Разблокируем все элементы управления
+        self._set_controls_enabled(True)
+        
+        c = stats["counts"]
+        save_path = stats.get("save_path", "")
+        self.log(f"\n{'='*55}\nГОТОВО\n{'='*55}")
+        self.log(f"🟢 Записано: {c['matched']} | 🔵 Добавлено: {c['added']} | 🟡 Не найдено: {c['not_found']}")
+        if save_path:
+            self.log(f"📁 Файл: {save_path}")
+        self._update_mem()
+        QMessageBox.information(self, "Готово",
+                                f"Расчёт завершён!\n\n"
+                                f"🟢 Записано:    {c['matched']}\n"
+                                f"🔵 Добавлено:   {c['added']}\n"
+                                f"🟡 Не найдено:  {c['not_found']}\n\n"
+                                f"📁 {save_path}")
+
+    def _on_error(self, msg: str):
+        self._cleanup_thread()
+        # Разблокируем все элементы управления
+        self._set_controls_enabled(True)
+        self.log(f"\n❌ ОШИБКА: {msg}")
+        QMessageBox.critical(self, "Ошибка", f"Произошла ошибка:\n{msg}")
+
+    def _cleanup_thread(self):
+        self._run_btn.setEnabled(True)
+        self._stop_btn.setEnabled(False)
+        if self._thread:
+            self._thread.quit()
+            self._thread.wait(3000)
+            self._thread = None
+        self._worker = None
+        gc.collect()
+
+# ── ТОЧКА ВХОДА ────────────────────────────────────────────────
+def main() -> None:
+    if not PYQT_AVAILABLE:
+        print("❌ PyQt5 не установлен.")
+        return
+
+    # Защита от повторного QApplication в IDLE
+    app = QApplication.instance()
+    owns_app = False
+    if app is None:
+        app = QApplication(sys.argv)
+        owns_app = True
+    app.setStyle("Fusion")
+    app.setStyleSheet(STYLESHEET)
+
+    window = MainWindow()
+
+    if owns_app:
+        # Запуск из командной строки / PyCharm
+        try:
+            sys.exit(app.exec_())
+        except KeyboardInterrupt:
+            print("\nПрограмма остановлена.")
+            sys.exit(0)
+    else:
+        # IDLE — просто показываем окно, exec_ не вызываем
+        # (IDLE уже крутит свой event loop)
+        window.show()
+        print("✓ Окно открыто. В IDLE закройте окно для завершения.")
+
+if __name__ == "__main__":
+    main()
