@@ -1,0 +1,102 @@
+    # ========== ДИАГНОСТИКА СОПОСТАВЛЕНИЯ ==========
+    print("\n" + "="*80)
+    print("ДИАГНОСТИКА СОПОСТАВЛЕНИЯ PIVOT ↔ ОТЧЕТ")
+    print(f"МРФ: {mrf_name}, База: {base_name}")
+    print("="*80)
+    
+    # Проверяем, какие колонки есть в pivot
+    print(f"\n--- КОЛОНКИ В PIVOT ---")
+    print(f"Колонки: {pivot.columns.tolist()}")
+    print(f"Есть '{BASE_COL_RF}': {BASE_COL_RF in pivot.columns}")
+    print(f"Есть '{BASE_COL_SEGMENT}': {BASE_COL_SEGMENT in pivot.columns}")
+    print(f"Есть '{BASE_COL_SUBSEG}': {BASE_COL_SUBSEG in pivot.columns}")
+    print(f"Есть '{BASE_COL_SERVICE}': {BASE_COL_SERVICE in pivot.columns}")
+    
+    # Проверяем, какие колонки есть в отчете
+    print(f"\n--- КОЛОНКИ В ОТЧЕТЕ ---")
+    print(f"Колонки: {df_report.columns.tolist()}")
+    print(f"Есть '{RPT_COL_RF}': {RPT_COL_RF in df_report.columns}")
+    print(f"Есть '{RPT_COL_SEGMENT}': {RPT_COL_SEGMENT in df_report.columns}")
+    print(f"Есть '{RPT_COL_SUBSEG}': {RPT_COL_SUBSEG in df_report.columns}")
+    print(f"Есть '{RPT_COL_SERVICE}': {RPT_COL_SERVICE in df_report.columns}")
+    
+    # Все уникальные РФ в pivot
+    print(f"\n--- ВСЕ РФ В PIVOT ---")
+    for rf in pivot[BASE_COL_RF].unique():
+        print(f"  - {rf}")
+    
+    # Все уникальные РФ в отчете
+    print(f"\n--- ВСЕ РФ В ОТЧЕТЕ ---")
+    if RPT_COL_RF in df_report.columns:
+        for rf in df_report[RPT_COL_RF].unique():
+            print(f"  - {rf}")
+    
+    # Детально по Тюменскому и Челябинскому
+    for rf_pattern in ["Тюменской", "Челябинский", "Екатеринбург"]:
+        print(f"\n{'='*50}")
+        print(f"ФИЛИАЛ: {rf_pattern}")
+        print(f"{'='*50}")
+        
+        # 1. Данные в PIVOT
+        mask_pivot = pivot[BASE_COL_RF].astype(str).str.contains(rf_pattern, case=False, na=False)
+        print(f"\n--- ДАННЫЕ В PIVOT для {rf_pattern} ---")
+        if mask_pivot.any():
+            filtered_pivot = pivot[mask_pivot]
+            print(f"Количество групп: {len(filtered_pivot)}")
+            print(f"Сумма эффекта (тыс): {filtered_pivot['Эффект_тыс'].sum():.3f}")
+            print(f"Сумма эффекта (руб): {filtered_pivot['Эффект_руб'].sum():.2f}")
+            
+            print(f"\nДетально по группам (первые 10):")
+            for idx, row in filtered_pivot.head(10).iterrows():
+                rf_val = row[BASE_COL_RF]
+                seg_val = row.get(BASE_COL_SEGMENT, "Н/Д")
+                sub_val = row.get(BASE_COL_SUBSEG, "Н/Д")
+                eff_val = row['Эффект_тыс']
+                print(f"  РФ: {rf_val}")
+                print(f"    Сегмент: {seg_val}")
+                print(f"    Подсегмент: {sub_val}")
+                print(f"    Эффект_тыс: {eff_val:.3f}")
+                print("    ---")
+        else:
+            print(f"❌ НЕТ ДАННЫХ в pivot для {rf_pattern}")
+        
+        # 2. Данные в отчете
+        print(f"\n--- ДАННЫЕ В ОТЧЕТЕ для {rf_pattern} ---")
+        if RPT_COL_RF in df_report.columns:
+            mask_report = df_report[RPT_COL_RF].astype(str).str.contains(rf_pattern, case=False, na=False)
+            if mask_report.any():
+                filtered_report = df_report[mask_report]
+                print(f"Количество строк: {len(filtered_report)}")
+                
+                # Показываем уникальные комбинации (Сегмент, Подсегмент) в отчете
+                print(f"\nУникальные комбинации (Сегмент, Подсегмент):")
+                combos = filtered_report[[RPT_COL_SEGMENT, RPT_COL_SUBSEG]].drop_duplicates()
+                for _, row in combos.iterrows():
+                    seg = row[RPT_COL_SEGMENT]
+                    sub = row[RPT_COL_SUBSEG]
+                    # Проверяем, есть ли такая комбинация в pivot
+                    has_in_pivot = False
+                    if mask_pivot.any():
+                        has_in_pivot = ((pivot[mask_pivot][BASE_COL_SEGMENT].astype(str).str.lower() == str(seg).lower()) & 
+                                       (pivot[mask_pivot][BASE_COL_SUBSEG].astype(str).str.lower() == str(sub).lower())).any()
+                    status = "✅ ЕСТЬ в pivot" if has_in_pivot else "❌ НЕТ в pivot"
+                    print(f"  {status}: Сег='{seg}', Под='{sub}'")
+                    
+                    # Показываем строки с этой комбинацией
+                    rows_with_combo = filtered_report[
+                        (filtered_report[RPT_COL_SEGMENT].astype(str).str.lower() == str(seg).lower()) &
+                        (filtered_report[RPT_COL_SUBSEG].astype(str).str.lower() == str(sub).lower())
+                    ]
+                    for _, r in rows_with_combo.head(3).iterrows():
+                        eff = r.get(target_col, "Н/Д")
+                        pct = r.get(RPT_COL_PCT, "Н/Д")
+                        print(f"      Строка: Эфф={eff}, %={pct}")
+            else:
+                print(f"❌ НЕТ ДАННЫХ в отчете для {rf_pattern}")
+        else:
+            print(f"⚠️  В отчете нет колонки '{RPT_COL_RF}'")
+    
+    print("\n" + "="*80)
+    print("КОНЕЦ ДИАГНОСТИКИ")
+    print("="*80 + "\n")
+    # ========== КОНЕЦ ДИАГНОСТИКИ ==========
