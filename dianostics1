@@ -1,0 +1,60 @@
+   # ========== ДИАГНОСТИКА: ОТКУДА ВЗЯЛСЯ ЭФФЕКТ 721.900 ==========
+    print("\n" + "="*80)
+    print("ДИАГНОСТИКА: РАСЧЕТ ЭФФЕКТА ДЛЯ ТЮМЕНСКОГО B2B 3К / Прочие 3К")
+    print("="*80)
+    
+    # Находим строки для Тюменского филиала с нужным сегментом
+    mask_rf = merged[BASE_COL_RF].astype(str).str.contains("Тюменской", case=False, na=False)
+    mask_seg = merged[BASE_COL_SEGMENT].astype(str).str.contains("B2B 3К", case=False, na=False)
+    mask_sub = merged[BASE_COL_SUBSEG].astype(str).str.contains("Прочие 3К", case=False, na=False)
+    
+    data = merged[mask_rf & mask_seg & mask_sub]
+    
+    if not data.empty:
+        print(f"\nНайдено строк: {len(data)}")
+        print(f"Сумма {base_col}: {data[base_col].sum():.2f}")
+        print(f"Сумма {amount_col}: {data[amount_col].sum():.2f}")
+        print(f"Сумма Эффект_руб: {data['Эффект_руб'].sum():.2f}")
+        print(f"Сумма Эффект_тыс: {data['Эффект_руб'].sum() / 1000:.3f}")
+        
+        print(f"\nДетально по абонентам (первые 20):")
+        print(f"{'MSISDN':<20} {'Начисление_ДО':<15} {'Начисление_ПОСЛЕ':<15} {'Эффект_руб':<15}")
+        print("-" * 70)
+        
+        for idx, row in data.head(20).iterrows():
+            msisdn = str(row[id_col])[:18]
+            base = row[base_col]
+            amount = row[amount_col] if pd.notna(row[amount_col]) else 0
+            eff = row['Эффект_руб']
+            print(f"{msisdn:<20} {base:<15.2f} {amount:<15.2f} {eff:<15.2f}")
+        
+        if len(data) > 20:
+            print(f"... и еще {len(data) - 20} строк")
+        
+        # Проверяем, есть ли NULL в amount_col
+        null_count = data[amount_col].isna().sum()
+        if null_count > 0:
+            print(f"\n⚠️  Строк с NULL в {amount_col} (не найдены в начислениях): {null_count}")
+            print(f"   Их эффект = 0 - {base_col} = отрицательный → обнулен")
+        
+        # Проверяем, сколько строк с положительным эффектом
+        pos_eff = data[data['Эффект_руб'] > 0]
+        print(f"\nСтрок с положительным эффектом: {len(pos_eff)}")
+        print(f"Сумма положительного эффекта: {pos_eff['Эффект_руб'].sum():.2f}")
+        
+        # Проверяем, сколько строк с нулевым эффектом
+        zero_eff = data[data['Эффект_руб'] == 0]
+        print(f"Строк с нулевым эффектом: {len(zero_eff)}")
+        
+        # Проверяем дубликаты MSISDN
+        dup_msisdn = data[id_col].value_counts()
+        dup_msisdn = dup_msisdn[dup_msisdn > 1]
+        if not dup_msisdn.empty:
+            print(f"\n⚠️  Есть дубликаты MSISDN: {len(dup_msisdn)}")
+            for msisdn, count in dup_msisdn.head(5).items():
+                print(f"   MSISDN {msisdn}: {count} раз")
+    else:
+        print("❌ НЕТ ДАННЫХ для Тюменского B2B 3К / Прочие 3К")
+    
+    print("\n" + "="*80)
+    # ========== КОНЕЦ ДИАГНОСТИКИ ==========
