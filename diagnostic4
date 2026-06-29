@@ -1,0 +1,79 @@
+# ========== РАСШИРЕННАЯ ДИАГНОСТИКА ЧЕЛЯБИНСКОГО ==========
+print("\n" + "="*80)
+print("РАСШИРЕННАЯ ДИАГНОСТИКА ДЛЯ ЧЕЛЯБИНСКОГО ФИЛИАЛА")
+print("="*80)
+
+# Маска для Челябинского филиала
+mask_rf = merged[BASE_COL_RF].astype(str).str.contains("Челябинск", case=False, na=False)
+mask_seg = merged[BASE_COL_SEGMENT].astype(str).str.contains("B2B 3K|B2B 3К", case=False, na=False)
+mask_sub = merged[BASE_COL_SUBSEG].astype(str).str.contains("ТОП|TOP", case=False, na=False)
+
+data = merged[mask_rf & mask_seg & mask_sub]
+
+if not data.empty:
+    print(f"\nВсего строк в выборке: {len(data)}")
+    
+    # 1. Проверка дубликатов MSISDN
+    dup_counts = data[id_col].value_counts()
+    dup_counts = dup_counts[dup_counts > 1]
+    if not dup_counts.empty:
+        print(f"\n⚠️ ЕСТЬ ДУБЛИКАТЫ MSISDN: {len(dup_counts)} шт.")
+        for msisdn, cnt in dup_counts.head(10).items():
+            print(f"  MSISDN {msisdn}: {cnt} раз")
+    else:
+        print("\n✅ Дубликатов MSISDN нет")
+    
+    # 2. Проверка NULL в amount_col
+    null_count = data[amount_col].isna().sum()
+    if null_count > 0:
+        print(f"\n⚠️ NULL в {amount_col}: {null_count} строк")
+        # Смотрим эти строки
+        null_data = data[data[amount_col].isna()]
+        print(f"  Сумма base_col у NULL-строк: {null_data[base_col].sum():.2f}")
+        print(f"  Их эффект был бы отрицательным и обнулён")
+    
+    # 3. Сравнение сумм
+    sum_base = data[base_col].sum()
+    sum_amount = data[amount_col].sum()
+    sum_eff = data["Эффект_руб"].sum()
+    
+    print(f"\n📊 Сумма ДО индексации: {sum_base:,.2f} руб.")
+    print(f"📊 Сумма ПОСЛЕ индексации: {sum_amount:,.2f} руб.")
+    print(f"📊 Сумма Эффект_руб: {sum_eff:,.2f} руб.")
+    print(f"📊 Сумма Эффект_тыс: {sum_eff/1000:,.3f} тыс. руб.")
+    
+    # 4. Детально по абонентам
+    print(f"\n📋 ДЕТАЛЬНО ПО АБОНЕНТАМ (все {len(data)}):")
+    print(f"{'MSISDN':<20} {'ДО':<15} {'ПОСЛЕ':<15} {'ЭФФЕКТ':<15} {'Статус'}")
+    print("-" * 80)
+    
+    sorted_data = data.sort_values(base_col, ascending=False)
+    for idx, row in sorted_data.iterrows():
+        msisdn = str(row[id_col])[:18]
+        base = row[base_col]
+        amount = row[amount_col] if pd.notna(row[amount_col]) else 0
+        eff = row["Эффект_руб"]
+        status = "✅" if eff > 0 else "⛔ обнулён" if amount == 0 else "⚠️ отрицат"
+        print(f"{msisdn:<20} {base:<15.2f} {amount:<15.2f} {eff:<15.2f} {status}")
+    
+    # 5. Проверка: если amount == base, то эффект 0
+    zero_eff = data[data["Эффект_руб"] == 0]
+    if not zero_eff.empty:
+        print(f"\n⚠️ Строк с нулевым эффектом: {len(zero_eff)}")
+        print(f"  Из них amount == base: {(zero_eff[amount_col] == zero_eff[base_col]).sum()}")
+        print(f"  Из них amount == 0: {(zero_eff[amount_col] == 0).sum()}")
+    
+    # 6. Проверка группировки
+    print(f"\n📊 Группировка по МРФ+РФ+Сегмент+Подсегмент:")
+    grouped = data.groupby([BASE_COL_MRF, BASE_COL_RF, BASE_COL_SEGMENT, BASE_COL_SUBSEG])["Эффект_руб"].sum()
+    print(grouped)
+    
+else:
+    print("❌ НЕТ ДАННЫХ для Челябинского B2B 3K / ТОП")
+    print("Проверьте написание:")
+    print(f"  - РФ содержит 'Челябинск': {merged[BASE_COL_RF].unique()[:10]}")
+    print(f"  - Сегмент содержит 'B2B 3K': {merged[BASE_COL_SEGMENT].unique()[:10]}")
+    print(f"  - Подсегмент содержит 'ТОП': {merged[BASE_COL_SUBSEG].unique()[:10]}")
+
+print("="*80)
+print()
