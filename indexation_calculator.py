@@ -1,4 +1,4 @@
-# indexation_calculator.py
+# indexation_calculator.py (финальная версия с правильным кешированием)
 import sys
 import os
 import pandas as pd
@@ -10,7 +10,6 @@ from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 import warnings
 from datetime import datetime
-from dateutil.relativedelta import relativedelta
 warnings.filterwarnings('ignore')
 
 # Импортируем маппинги
@@ -18,10 +17,11 @@ from mappings import *
 
 class ColumnSelectionDialog(QDialog):
     """Диалог для выбора колонок из файла"""
-    def __init__(self, columns, title="Выбор колонок", parent=None):
+    def __init__(self, columns, title="Выбор колонок", parent=None, required_only=False):
         super().__init__(parent)
         self.columns = columns
         self.title = title
+        self.required_only = required_only
         self.selected = {}
         self.initUI()
         
@@ -35,15 +35,24 @@ class ColumnSelectionDialog(QDialog):
         scroll_layout = QVBoxLayout(scroll_widget)
         
         self.comboboxes = {}
-        labels = [
-            ("MSISDN (идентификатор)", "msisdn"),
-            ("Начисления ДО индексации", "charges_before"),
-            ("Краткий сегмент", "short_seg"),
-            ("Подсегмент", "sub_seg"),
-            ("МРФ", "mrf"),
-            ("РФ (регион)", "region"),
-            ("Процент индексации", "percent")
-        ]
+        
+        if self.required_only:
+            # Для файла начислений - только MSISDN и сумма
+            labels = [
+                ("MSISDN (идентификатор)", "msisdn"),
+                ("Сумма начислений", "charges")
+            ]
+        else:
+            # Для базы индексации - все колонки
+            labels = [
+                ("MSISDN (идентификатор)", "msisdn"),
+                ("Начисления ДО индексации", "charges_before"),
+                ("Краткий сегмент", "short_seg"),
+                ("Подсегмент", "sub_seg"),
+                ("МРФ", "mrf"),
+                ("РФ (регион)", "region"),
+                ("Процент индексации", "percent")
+            ]
         
         for label, key in labels:
             row_layout = QHBoxLayout()
@@ -122,13 +131,21 @@ class IndexationApp(QMainWindow):
         self.initUI()
         self.files_loaded = {
             'report': None,
-            'base': [],
-            'charges': None
+            'base': []
+        }
+        # Кеш для текущего МРФ
+        self.cache = {
+            'charges_df': None,          # DataFrame начислений для текущего МРФ
+            'charges_dict': None,        # Словарь MSISDN->сумма для текущего МРФ
+            'charges_file': None,        # Имя файла
+            'charges_columns': None,     # Выбранные колонки
+            'charges_loaded': False,     # Флаг загрузки
+            'charges_count': 0,          # Количество записей
+            'current_mrf': None          # Для какого МРФ загружены начисления
         }
         self.data = {
             'report_df': None,
             'base_df': None,
-            'charges_df': None,
             'selected_mrf': [],
             'selected_regions': [],
             'selected_month': None,
@@ -139,7 +156,9 @@ class IndexationApp(QMainWindow):
             'selected_subsegments': [],
             'mode': None,
             'column_mapping': {},
-            'service_name': None
+            'service_name': None,
+            'current_mrf_index': 0,
+            'processing_mrf': None       # Какой МРФ сейчас обрабатывается
         }
         self.results = {}
         self.log = []
@@ -177,7 +196,7 @@ class IndexationApp(QMainWindow):
     def setup_ui(self):
         layout = QVBoxLayout(self.setup_tab)
         
-        # Создаем скролл-зону для всей настройки
+        # Создаем скролл-зону
         scroll = QScrollArea()
         scroll_widget = QWidget()
         scroll_layout = QVBoxLayout(scroll_widget)
@@ -252,10 +271,37 @@ class IndexationApp(QMainWindow):
         btn_layout.addWidget(self.load_charges_btn)
         files_layout.addLayout(btn_layout)
         
+        # Информация о файлах
         self.files_info = QTextEdit()
         self.files_info.setReadOnly(True)
         self.files_info.setMaximumHeight(80)
         files_layout.addWidget(self.files_info)
+        
+        # Информация о кеше начислений для текущего МРФ
+        cache_group = QGroupBox("Кеш начислений (текущий МРФ)")
+        cache_layout = QVBoxLayout()
+        
+        cache_status_layout = QHBoxLayout()
+        self.cache_status_label = QLabel("❌ Не загружены")
+        self.cache_status_label.setStyleSheet("color: red; font-weight: bold;")
+        self.cache_info_label = QLabel("")
+        self.clear_cache_btn = QPushButton("Очистить кеш")
+        self.clear_cache_btn.clicked.connect(self.clear_cache)
+        self.clear_cache_btn.setEnabled(False)
+        
+        cache_status_layout.addWidget(QLabel("Статус:"))
+        cache_status_layout.addWidget(self.cache_status_label)
+        cache_status_layout.addWidget(self.cache_info_label)
+        cache_status_layout.addStretch()
+        cache_status_layout.addWidget(self.clear_cache_btn)
+        cache_layout.addLayout(cache_status_layout)
+        
+        # Информация о текущем МРФ
+        self.cache_mrf_label = QLabel("Текущий МРФ: не выбран")
+        cache_layout.addWidget(self.cache_mrf_label)
+        
+        cache_group.setLayout(cache_layout)
+        files_layout.addWidget(cache_group)
         
         files_group.setLayout(files_layout)
         scroll_layout.addWidget(files_group)
@@ -278,7 +324,7 @@ class IndexationApp(QMainWindow):
         columns_group = QGroupBox("5. Настройка колонок")
         columns_layout = QVBoxLayout()
         
-        self.column_setup_btn = QPushButton("Настроить соответствие колонок")
+        self.column_setup_btn = QPushButton("Настроить соответствие колонок в базе индексации")
         self.column_setup_btn.clicked.connect(self.setup_columns)
         self.column_setup_btn.setEnabled(False)
         columns_layout.addWidget(self.column_setup_btn)
@@ -389,6 +435,39 @@ class IndexationApp(QMainWindow):
             self.log_text.append(log_entry)
         print(log_entry)
         
+    def update_cache_status(self):
+        """Обновляет статус кеша начислений для текущего МРФ"""
+        if self.cache['charges_loaded']:
+            self.cache_status_label.setText("✅ Загружены")
+            self.cache_status_label.setStyleSheet("color: green; font-weight: bold;")
+            mrf_name = self.cache['current_mrf'] if self.cache['current_mrf'] else "неизвестный"
+            self.cache_info_label.setText(
+                f"Файл: {os.path.basename(self.cache['charges_file'])} | "
+                f"Записей: {self.cache['charges_count']:,} | "
+                f"МРФ: {mrf_name}"
+            )
+            self.clear_cache_btn.setEnabled(True)
+        else:
+            self.cache_status_label.setText("❌ Не загружены")
+            self.cache_status_label.setStyleSheet("color: red; font-weight: bold;")
+            self.cache_info_label.setText("")
+            self.clear_cache_btn.setEnabled(False)
+            
+    def clear_cache(self):
+        """Очищает кеш начислений для текущего МРФ"""
+        if self.cache['charges_loaded']:
+            mrf_name = self.cache['current_mrf'] if self.cache['current_mrf'] else "неизвестный"
+            self.add_log(f"Очистка кеша начислений для МРФ: {mrf_name}")
+        
+        self.cache['charges_df'] = None
+        self.cache['charges_dict'] = None
+        self.cache['charges_file'] = None
+        self.cache['charges_columns'] = None
+        self.cache['charges_loaded'] = False
+        self.cache['charges_count'] = 0
+        self.cache['current_mrf'] = None
+        self.update_cache_status()
+        
     def on_month_changed(self, month):
         self.data['selected_month'] = month
         self.add_log(f"Выбран месяц: {month}")
@@ -479,25 +558,108 @@ class IndexationApp(QMainWindow):
                 self.add_log(f"Ошибка загрузки базы: {str(e)}")
                 
     def load_charges_file(self):
+        """Загружает файл начислений для текущего МРФ"""
         if self.files_loaded['report'] is None:
             QMessageBox.warning(self, "Предупреждение", "Сначала загрузите файл отчета!")
             return
             
+        # Проверяем, для какого МРФ загружаем начисления
+        if not self.data['selected_mrf']:
+            QMessageBox.warning(self, "Предупреждение", "Сначала выберите МРФ!")
+            return
+            
+        # Определяем текущий МРФ
+        current_mrf = self.data.get('processing_mrf')
+        if current_mrf is None and self.data['selected_mrf']:
+            current_mrf = self.data['selected_mrf'][0]  # Берем первый МРФ для загрузки
+            
+        if not current_mrf:
+            QMessageBox.warning(self, "Предупреждение", "Не удалось определить МРФ для загрузки начислений!")
+            return
+            
+        # Проверяем, не загружены ли уже начисления для этого МРФ
+        if self.cache['charges_loaded'] and self.cache['current_mrf'] == current_mrf:
+            reply = QMessageBox.question(
+                self, 
+                "Кеш начислений", 
+                f"Начисления для МРФ {current_mrf} уже загружены.\n"
+                f"Файл: {os.path.basename(self.cache['charges_file'])}\n"
+                f"Записей: {self.cache['charges_count']:,}\n\n"
+                "Загрузить новый файл? (текущий кеш будет очищен)",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            if reply == QMessageBox.No:
+                return
+            else:
+                self.clear_cache()
+            
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Выберите файл с начислениями", "", 
+            self, 
+            f"Выберите файл начислений для МРФ {current_mrf}", 
+            "", 
             "Excel files (*.xlsx);;All files (*.*)"
         )
         if file_path:
             try:
-                self.data['charges_df'] = pd.read_excel(file_path, sheet_name='Sheet')
+                # Загружаем DataFrame
+                df = pd.read_excel(file_path, sheet_name='Sheet')
+                
+                # Пользователь выбирает колонки
+                columns = list(df.columns)
+                dialog = ColumnSelectionDialog(columns, 
+                    f"Выбор колонок в файле начислений для МРФ {current_mrf}", 
+                    self, 
+                    required_only=True
+                )
+                if dialog.exec_() != QDialog.Accepted:
+                    return
+                    
+                charges_mapping = dialog.get_selections()
+                if 'msisdn' not in charges_mapping or 'charges' not in charges_mapping:
+                    QMessageBox.warning(self, "Ошибка", "Не выбраны обязательные колонки!")
+                    return
+                    
+                # Переименовываем колонки
+                df_renamed = df.rename(columns={
+                    charges_mapping['msisdn']: 'MSISDN_charges',
+                    charges_mapping['charges']: 'AP_POSLE'
+                })
+                
+                # Создаем словарь для быстрого доступа
+                charges_dict = {}
+                for _, row in df_renamed.iterrows():
+                    msisdn = str(row['MSISDN_charges']).strip()
+                    try:
+                        amount = float(row['AP_POSLE'])
+                        charges_dict[msisdn] = amount
+                    except:
+                        charges_dict[msisdn] = 0.0
+                        
+                # Сохраняем в кеш
+                self.cache['charges_df'] = df_renamed
+                self.cache['charges_dict'] = charges_dict
+                self.cache['charges_file'] = file_path
+                self.cache['charges_columns'] = charges_mapping
+                self.cache['charges_loaded'] = True
+                self.cache['charges_count'] = len(charges_dict)
+                self.cache['current_mrf'] = current_mrf
+                
                 self.files_loaded['charges'] = file_path
                 self.update_files_info()
-                self.add_log(f"Загружен файл начислений: {os.path.basename(file_path)}")
-                self.add_log(f"Колонки в начислениях: {list(self.data['charges_df'].columns)}")
+                self.update_cache_status()
+                self.cache_mrf_label.setText(f"Текущий МРФ: {current_mrf}")
+                
+                self.add_log(f"Загружены начисления для МРФ {current_mrf}")
+                self.add_log(f"  Файл: {os.path.basename(file_path)}")
+                self.add_log(f"  Количество записей: {len(charges_dict):,}")
+                self.add_log(f"  Колонки: MSISDN={charges_mapping['msisdn']}, Сумма={charges_mapping['charges']}")
+                
                 self.check_ready()
+                
             except Exception as e:
                 QMessageBox.critical(self, "Ошибка", f"Не удалось загрузить файл начислений:\n{str(e)}")
                 self.add_log(f"Ошибка загрузки начислений: {str(e)}")
+                self.clear_cache()
                 
     def update_files_info(self):
         info = ""
@@ -512,8 +674,9 @@ class IndexationApp(QMainWindow):
         else:
             info += "❌ База индексации: не загружена\n"
             
-        if self.files_loaded['charges']:
-            info += f"✅ Начисления: {os.path.basename(self.files_loaded['charges'])}\n"
+        if self.cache['charges_loaded']:
+            info += f"✅ Начисления (кеш): {os.path.basename(self.cache['charges_file'])} "
+            info += f"({self.cache['charges_count']:,} записей, МРФ: {self.cache['current_mrf']})\n"
         else:
             info += "❌ Начисления: не загружены\n"
             
@@ -528,10 +691,14 @@ class IndexationApp(QMainWindow):
             self.data['mode'] = 'B'
             self.load_charges_btn.setEnabled(False)
             self.add_log("Выбран режим Б: начисления в базе индексации")
+            # При переключении на режим Б очищаем кеш
+            if self.cache['charges_loaded']:
+                self.clear_cache()
+                self.add_log("Кеш очищен при смене режима на Б")
         self.check_ready()
         
     def setup_columns(self):
-        """Настройка соответствия колонок"""
+        """Настройка соответствия колонок в базе индексации"""
         if self.data['base_df'] is None:
             QMessageBox.warning(self, "Ошибка", "Сначала загрузите базу индексации!")
             return
@@ -555,7 +722,8 @@ class IndexationApp(QMainWindow):
                 if 'percent' in selections and selections['percent']:
                     try:
                         percent_val = self.data['base_df'][selections['percent']].iloc[0]
-                        self.percent_edit.setText(str(percent_val))
+                        if pd.notna(percent_val):
+                            self.percent_edit.setText(str(percent_val))
                     except:
                         pass
             else:
@@ -589,17 +757,21 @@ class IndexationApp(QMainWindow):
             ready = False
             issues.append("Не загружена база индексации")
             
-        if self.data['mode'] == 'A' and self.files_loaded['charges'] is None:
-            ready = False
-            issues.append("Не загружен файл начислений (режим А)")
-            
+        if self.data['mode'] == 'A':
+            if not self.cache['charges_loaded']:
+                ready = False
+                issues.append("Не загружены начисления для текущего МРФ")
+            elif self.cache['current_mrf'] not in self.data['selected_mrf']:
+                ready = False
+                issues.append(f"Начисления загружены для другого МРФ: {self.cache['current_mrf']}")
+        
         if self.data['selected_month'] is None:
             ready = False
             issues.append("Не выбран отчетный месяц")
             
         if not self.data['column_mapping']:
             ready = False
-            issues.append("Не настроены колонки")
+            issues.append("Не настроены колонки в базе индексации")
             
         if self.data['indexation_date'] is None:
             ready = False
@@ -658,66 +830,6 @@ class IndexationApp(QMainWindow):
                 
             base_df = base_df.rename(columns=rename_map)
             
-            # Подтягиваем начисления после индексации
-            if self.data['mode'] == 'A':
-                if self.files_loaded['charges'] is None:
-                    QMessageBox.warning(self, "Ошибка", "Не загружены начисления (режим А)")
-                    return
-                    
-                charges_df = self.data['charges_df'].copy()
-                
-                # Определяем колонки в файле начислений
-                charges_cols = list(charges_df.columns)
-                msisdn_charges = None
-                sum_charges = None
-                
-                # Пользователь выбирает колонки для начислений
-                dialog = ColumnSelectionDialog(charges_cols, "Выбор колонок в файле начислений", self)
-                if dialog.exec_() != QDialog.Accepted:
-                    return
-                    
-                charges_mapping = dialog.get_selections()
-                if 'msisdn' not in charges_mapping or 'charges_before' not in charges_mapping:
-                    QMessageBox.warning(self, "Ошибка", "Не выбраны обязательные колонки в начислениях!")
-                    return
-                    
-                charges_df = charges_df.rename(columns={
-                    charges_mapping['msisdn']: 'MSISDN_charges',
-                    charges_mapping['charges_before']: 'AP_POSLE'
-                })
-                
-                # Создаем словарь для маппинга
-                charges_dict = {}
-                for _, row in charges_df.iterrows():
-                    msisdn = str(row['MSISDN_charges']).strip()
-                    try:
-                        amount = float(row['AP_POSLE'])
-                        charges_dict[msisdn] = amount
-                    except:
-                        charges_dict[msisdn] = 0.0
-                        
-                base_df['AP_POSLE'] = base_df['MSISDN'].astype(str).map(charges_dict).fillna(0)
-                
-            else:  # Режим Б
-                # Пользователь выбирает колонку с начислениями ПОСЛЕ
-                columns = list(base_df.columns)
-                dialog = ColumnSelectionDialog(columns, "Выбор колонки с начислениями ПОСЛЕ индексации", self)
-                if dialog.exec_() != QDialog.Accepted:
-                    return
-                    
-                charges_mapping = dialog.get_selections()
-                if 'charges_before' not in charges_mapping:
-                    QMessageBox.warning(self, "Ошибка", "Не выбрана колонка с начислениями ПОСЛЕ!")
-                    return
-                    
-                base_df = base_df.rename(columns={
-                    charges_mapping['charges_before']: 'AP_POSLE'
-                })
-                
-            # Проверяем наличие сегментов
-            has_short_seg = 'Краткий_сегмент' in base_df.columns
-            has_sub_seg = 'Подсегмент' in base_df.columns
-            
             # Получаем выбранные МРФ
             selected_mrf = self.data['selected_mrf']
             month = self.data['selected_month']
@@ -727,28 +839,93 @@ class IndexationApp(QMainWindow):
             self.add_log(f"Услуга: {service}")
             self.add_log(f"Дата индексации: {index_date.strftime('%d.%m.%Y')}")
             self.add_log(f"Отчетный месяц: {month}")
+            self.add_log(f"Выбрано МРФ: {', '.join(selected_mrf)}")
             
             # Обрабатываем каждый МРФ
             total_processed = 0
             total_mrf = len(selected_mrf)
             
             for i, mrf in enumerate(selected_mrf):
-                self.progress_bar.setValue(int((i / total_mrf) * 50))
-                self.add_log(f"\nОбработка МРФ: {mrf}")
+                self.progress_bar.setValue(int((i / total_mrf) * 40))
+                self.add_log(f"\n{'='*40}")
+                self.add_log(f"Обработка МРФ: {mrf} ({i+1}/{total_mrf})")
+                
+                # Обновляем текущий МРФ
+                self.data['processing_mrf'] = mrf
+                
+                # В режиме А запрашиваем начисления для этого МРФ
+                if self.data['mode'] == 'A':
+                    # Проверяем, есть ли кеш для этого МРФ
+                    if not self.cache['charges_loaded'] or self.cache['current_mrf'] != mrf:
+                        self.add_log(f"  Запрашиваем начисления для МРФ {mrf}")
+                        reply = QMessageBox.question(
+                            self,
+                            "Загрузка начислений",
+                            f"Для МРФ {mrf} не загружены начисления.\n"
+                            "Загрузить файл начислений?",
+                            QMessageBox.Yes | QMessageBox.No
+                        )
+                        if reply == QMessageBox.No:
+                            self.add_log(f"  Пропускаем МРФ {mrf} (нет начислений)")
+                            continue
+                        else:
+                            # Очищаем старый кеш и загружаем новый
+                            self.clear_cache()
+                            self.load_charges_file()
+                            if not self.cache['charges_loaded']:
+                                self.add_log(f"  Пропускаем МРФ {mrf} (не удалось загрузить начисления)")
+                                continue
+                    
+                    # Используем кешированные начисления
+                    charges_dict = self.cache['charges_dict']
+                    self.add_log(f"  Используем кешированные начисления из файла: {os.path.basename(self.cache['charges_file'])}")
+                    self.add_log(f"    Записей в кеше: {len(charges_dict):,}")
+                    
+                    # Применяем словарь к базе
+                    base_df_copy = base_df.copy()
+                    base_df_copy['AP_POSLE'] = base_df_copy['MSISDN'].astype(str).map(charges_dict).fillna(0)
+                    
+                else:  # Режим Б
+                    # Пользователь выбирает колонку с начислениями ПОСЛЕ
+                    self.add_log(f"  Запрашиваем колонку с начислениями ПОСЛЕ для МРФ {mrf}")
+                    columns = list(base_df.columns)
+                    dialog = ColumnSelectionDialog(columns, 
+                        f"Выбор колонки с начислениями ПОСЛЕ для МРФ {mrf}", 
+                        self, 
+                        required_only=True
+                    )
+                    if dialog.exec_() != QDialog.Accepted:
+                        self.add_log(f"  Пропускаем МРФ {mrf} (не выбрана колонка)")
+                        continue
+                        
+                    charges_mapping = dialog.get_selections()
+                    if 'charges' not in charges_mapping:
+                        self.add_log(f"  Пропускаем МРФ {mrf} (не выбрана колонка с начислениями)")
+                        continue
+                        
+                    base_df_copy = base_df.copy()
+                    base_df_copy = base_df_copy.rename(columns={
+                        charges_mapping['charges']: 'AP_POSLE'
+                    })
                 
                 # Получаем регионы для МРФ
                 regions = MRF_TO_RF.get(mrf, [])
                 
                 # Фильтруем данные по МРФ
-                mrf_data = base_df[base_df['МРФ_исх'].str.contains(mrf, case=False, na=False)]
+                mrf_data = base_df_copy[base_df_copy['МРФ_исх'].str.contains(mrf, case=False, na=False)]
                 
                 if mrf_data.empty:
                     self.add_log(f"  Нет данных для МРФ {mrf}")
                     continue
                     
-                self.add_log(f"  Найдено записей: {len(mrf_data)}")
+                self.add_log(f"  Найдено записей в базе: {len(mrf_data):,}")
+                
+                # Проверяем наличие сегментов
+                has_short_seg = 'Краткий_сегмент' in mrf_data.columns
+                has_sub_seg = 'Подсегмент' in mrf_data.columns
                 
                 # Рассчитываем эффект по каждому региону
+                mrf_total = 0
                 for region in regions:
                     region_data = mrf_data[mrf_data['РФ_исх'].str.contains(region, case=False, na=False)]
                     if region_data.empty:
@@ -769,12 +946,13 @@ class IndexationApp(QMainWindow):
                                     region=region,
                                     short_seg=short_seg,
                                     sub_seg=sub_seg,
-                                    effect=effect / 1000,  # переводим в тыс. руб.
+                                    effect=effect / 1000,
                                     service=service,
                                     index_date=index_date,
                                     month=month
                                 )
                                 total_processed += 1
+                                mrf_total += 1
                     else:
                         # Если сегментов нет - группируем по региону
                         total_after = region_data['AP_POSLE'].sum()
@@ -793,23 +971,40 @@ class IndexationApp(QMainWindow):
                                 month=month
                             )
                             total_processed += 1
-                            
+                            mrf_total += 1
+                
+                self.add_log(f"  Записано записей для МРФ {mrf}: {mrf_total}")
+                
+                # Очищаем кеш после обработки МРФ (если это не последний МРФ)
+                if i < len(selected_mrf) - 1:
+                    self.add_log(f"  Очищаем кеш начислений после обработки МРФ {mrf}")
+                    self.clear_cache()
+                    self.cache_mrf_label.setText("Текущий МРФ: не выбран")
+                    self.add_log("  Готов к следующему МРФ")
+                
+                self.progress_bar.setValue(int(((i + 1) / total_mrf) * 80))
+                    
             self.progress_bar.setValue(100)
-            self.add_log(f"\n✅ РАСЧЕТ ЗАВЕРШЕН")
+            self.add_log(f"\n{'='*60}")
+            self.add_log(f"✅ РАСЧЕТ ЗАВЕРШЕН")
             self.add_log(f"Обработано записей: {total_processed}")
             self.add_log("=" * 60)
             
             QMessageBox.information(
                 self, 
                 "Готово", 
-                f"Расчет успешно завершен!\nОбработано записей: {total_processed}\nРезультаты записаны в файл отчета."
+                f"Расчет успешно завершен!\n"
+                f"Обработано записей: {total_processed}\n"
+                f"Результаты записаны в файл отчета."
             )
             
             self.show_results()
             
         except Exception as e:
-            QMessageBox.critical(self, "Ошибка", f"Произошла ошибка при расчете:\n{str(e)}")
+            # При ошибке очищаем кеш
             self.add_log(f"ОШИБКА: {str(e)}")
+            self.clear_cache()
+            QMessageBox.critical(self, "Ошибка", f"Произошла ошибка при расчете:\n{str(e)}")
             import traceback
             self.add_log(traceback.format_exc())
             
@@ -908,11 +1103,17 @@ class IndexationApp(QMainWindow):
         try:
             if self.files_loaded['report']:
                 df = pd.read_excel(self.files_loaded['report'], sheet_name='Факт-эффект индексации 2026')
-                # Показываем последние добавленные данные
                 self.results_text.setText(df.tail(20).to_string())
                 self.add_log(f"Показаны последние 20 записей из отчета")
         except Exception as e:
             self.results_text.setText(f"Не удалось отобразить результаты: {str(e)}")
+            
+    def closeEvent(self, event):
+        """Обработка закрытия программы - очищаем кеш"""
+        if self.cache['charges_loaded']:
+            self.add_log(f"Очистка кеша начислений при закрытии программы")
+            self.clear_cache()
+        event.accept()
 
 def main():
     app = QApplication(sys.argv)
