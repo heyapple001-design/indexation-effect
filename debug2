@@ -1,0 +1,20 @@
+# === Прогресс-бар ===
+self.progress_bar = QProgressBar()
+self.progress_bar.setVisible(False)  # Скрыт по умолчанию
+self.progress_bar.setMinimum(0)
+self.progress_bar.setMaximum(100)
+self.progress_bar.setValue(0)
+self.progress_label = QLabel("Готов к работе")
+self.progress_label.setVisible(False)
+
+progress_layout = QHBoxLayout()
+progress_layout.addWidget(self.progress_label)
+progress_layout.addWidget(self.progress_bar)
+scroll_layout.addLayout(progress_layout)
+
+# Добавляем кнопку остановки
+self.btn_stop_calculation = QPushButton("⏹ Остановить расчёт")
+self.btn_stop_calculation.clicked.connect(self._stop_calculation)
+self.btn_stop_calculation.setEnabled(False)
+self.btn_stop_calculation.setStyleSheet("background-color: #f44336; color: white;")
+scroll_layout.addWidget(self.btn_stop_calculation)
