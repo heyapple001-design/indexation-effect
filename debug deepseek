@@ -31,254 +31,7 @@ from PyQt5.QtGui import QFont, QColor
 
 
 # ─────────────────────────────────────────────
-#  1. ПОТОКИ ДЛЯ ФОНОВЫХ ЗАДАЧ
-# ─────────────────────────────────────────────
-
-class FileLoadThread(QThread):
-    """Поток для загрузки Excel файлов без блокировки GUI"""
-    progress_updated = pyqtSignal(str)
-    file_loaded = pyqtSignal(pd.DataFrame, str)  # (dataframe, filename)
-    error_occurred = pyqtSignal(str)
-    
-    def __init__(self, filepath, sheet_name='Лист1'):
-        super().__init__()
-        self.filepath = filepath
-        self.sheet_name = sheet_name
-        
-    def run(self):
-        try:
-            self.progress_updated.emit(f"⏳ Загрузка {os.path.basename(self.filepath)}...")
-            df = pd.read_excel(self.filepath, sheet_name=self.sheet_name, engine='openpyxl')
-            self.file_loaded.emit(df, os.path.basename(self.filepath))
-        except Exception as e:
-            self.error_occurred.emit(str(e))
-
-
-class CalculationThread(QThread):
-    """Поток для выполнения тяжёлых расчётов без блокировки GUI"""
-    
-    progress_updated = pyqtSignal(int, str)  # (процент, сообщение)
-    log_message = pyqtSignal(str)
-    calculation_finished = pyqtSignal(dict, dict)  # (results, stats)
-    error_occurred = pyqtSignal(str)
-    
-    def __init__(self, df_base, col_mapping, accruals_cache, mode, 
-                 filter_dates, filter_services, filter_segments, filter_subsegments):
-        super().__init__()
-        self.df_base = df_base
-        self.col_mapping = col_mapping
-        self.accruals_cache = accruals_cache
-        self.mode = mode
-        self.filter_dates = filter_dates
-        self.filter_services = filter_services
-        self.filter_segments = filter_segments
-        self.filter_subsegments = filter_subsegments
-        self._is_running = True
-        
-    def stop(self):
-        """Остановить выполнение"""
-        self._is_running = False
-        
-    def run(self):
-        """Запуск расчёта в отдельном потоке"""
-        try:
-            self.log_message.emit("⏳ Начинаем расчёт в фоновом режиме...")
-            self.progress_updated.emit(5, "Подготовка данных...")
-            
-            results, stats = self._process_base_with_progress(
-                df_base=self.df_base,
-                col_mapping=self.col_mapping,
-                accruals_dict=self.accruals_cache if self.mode == 'A' else {},
-                mode=self.mode,
-                filter_dates=self.filter_dates,
-                filter_services=self.filter_services,
-                filter_segments=self.filter_segments,
-                filter_subsegments=self.filter_subsegments
-            )
-            
-            if not self._is_running:
-                self.log_message.emit("⚠️ Расчёт был остановлен пользователем")
-                return
-                
-            self.progress_updated.emit(100, "Расчёт завершён!")
-            self.calculation_finished.emit(results, stats)
-            
-        except Exception as e:
-            import traceback
-            error_msg = f"Ошибка в потоке расчёта:\n{traceback.format_exc()}"
-            self.error_occurred.emit(error_msg)
-            
-    def _process_base_with_progress(self, **kwargs):
-        """Модифицированная версия process_base с поддержкой прогресса"""
-        df_base = kwargs['df_base']
-        col_mapping = kwargs['col_mapping']
-        accruals_dict = kwargs['accruals_dict']
-        mode = kwargs['mode']
-        filter_dates = kwargs['filter_dates']
-        filter_services = kwargs['filter_services']
-        filter_segments = kwargs['filter_segments']
-        filter_subsegments = kwargs['filter_subsegments']
-        
-        results = defaultdict(float)
-        stats = {'total_rows': 0, 'processed': 0, 'no_accrual': 0, 'zero_effect': 0}
-        
-        col_msisdn = col_mapping['msisdn']
-        col_ap_before = col_mapping['ap_before']
-        col_ap_after = col_mapping.get('ap_after', '')
-        col_date = col_mapping.get('date', '')
-        col_service = col_mapping.get('service', '')
-        col_percent = col_mapping.get('percent', '')
-        col_mrf = col_mapping.get('mrf', '')
-        col_rf = col_mapping.get('rf', '')
-        col_segment = col_mapping.get('short_segment', '')
-        col_subsegment = col_mapping.get('subsegment', '')
-        col_accrual = col_mapping.get('accrual_report', '')
-        
-        total_rows = len(df_base)
-        stats['total_rows'] = total_rows
-        
-        # Отправляем прогресс каждые 5% или каждые 1000 строк
-        progress_step = max(1, total_rows // 20)  # 20 шагов = 5% каждый
-        
-        for idx, row in df_base.iterrows():
-            # Проверка на остановку
-            if not self._is_running:
-                return {}, stats
-                
-            # Получаем значения
-            msisdn = str(row.get(col_msisdn, '')).strip()
-            if not msisdn:
-                continue
-
-            ap_before = self._safe_float(row.get(col_ap_before, 0))
-            ap_after = self._safe_float(row.get(col_ap_after, 0)) if col_ap_after else 0.0
-
-            date_val = str(row.get(col_date, '')).strip() if col_date else ''
-            service_val = str(row.get(col_service, '')).strip() if col_service else ''
-            percent_val = str(row.get(col_percent, '')).strip() if col_percent else ''
-            mrf_val = str(row.get(col_mrf, '')).strip() if col_mrf else ''
-            rf_val = str(row.get(col_rf, '')).strip() if col_rf else ''
-            segment_val = str(row.get(col_segment, '')).strip() if col_segment else ''
-            subsegment_val = str(row.get(col_subsegment, '')).strip() if col_subsegment else ''
-
-            # Фильтры
-            if filter_dates and date_val not in filter_dates:
-                continue
-            if filter_services and service_val not in filter_services:
-                continue
-            if filter_segments and segment_val not in filter_segments:
-                continue
-            if filter_subsegments and subsegment_val not in filter_subsegments:
-                continue
-
-            # Получаем начисления за отчётный месяц
-            if mode == 'A':
-                # Из кеша начислений
-                msisdn_key = msisdn
-                accrual_report = accruals_dict.get(msisdn_key)
-                if accrual_report is None:
-                    # Попробуем без 8 или 7
-                    if msisdn.startswith('8') and len(msisdn) == 11:
-                        accrual_report = accruals_dict.get('7' + msisdn[1:])
-                    elif msisdn.startswith('7') and len(msisdn) == 11:
-                        accrual_report = accruals_dict.get('8' + msisdn[1:])
-                    if accrual_report is None:
-                        # Попробуем только 10 цифр
-                        if len(msisdn) >= 10:
-                            accrual_report = accruals_dict.get(msisdn[-10:])
-                if accrual_report is None:
-                    accrual_report = 0.0
-                    stats['no_accrual'] += 1
-            else:
-                # Режим Б — начисления в базе
-                accrual_report = self._safe_float(row.get(col_accrual, 0)) if col_accrual else 0.0
-
-            # Приводим МРФ к формату отчёта
-            mrf_report = self._normalize_mrf_to_report(mrf_val)
-            if not mrf_report and rf_val:
-                mrf_report = self._rf_to_report_mrf(rf_val)
-            if not mrf_report:
-                mrf_report = mrf_val
-
-            # Расчёт эффекта
-            effect = self._calc_fact_effect(accrual_report, ap_before, ap_after)
-
-            if effect == 0:
-                stats['zero_effect'] += 1
-
-            # Агрегация
-            key = (service_val, date_val, percent_val, mrf_report, rf_val, segment_val, subsegment_val)
-            results[key] += effect
-            stats['processed'] += 1
-            
-            # Отправляем прогресс
-            if idx % progress_step == 0 and idx > 0:
-                percent = int((idx / total_rows) * 100)
-                self.progress_updated.emit(percent, f"Обработано {idx}/{total_rows} строк...")
-                
-        return dict(results), stats
-    
-    @staticmethod
-    def _safe_float(val, default=0.0):
-        """Безопасное преобразование в float."""
-        if val is None:
-            return default
-        try:
-            v = float(str(val).replace(',', '.').replace(' ', '').strip())
-            return v
-        except (ValueError, TypeError):
-            return default
-    
-    @staticmethod
-    def _calc_fact_effect(accrual_report, ap_before, ap_after):
-        """Расчёт фактического эффекта для одного абонента."""
-        if ap_before > 0:
-            delta = accrual_report - ap_before
-            return max(0.0, delta)
-        else:
-            if abs(accrual_report - ap_after) < 0.01:
-                return max(0.0, ap_after - ap_before)
-            elif accrual_report > ap_before:
-                return max(0.0, accrual_report - ap_before)
-            else:
-                return 0.0
-    
-    def _normalize_mrf_to_report(self, mrf_value):
-        """Привести значение МРФ к формату отчёта."""
-        # Загружаем MAPPINGS из глобальной переменной
-        global MAPPINGS
-        MRF_FULL_TO_SHORT = MAPPINGS['MRF_FULL_TO_SHORT']
-        MRF_SHORT_TO_FULL = MAPPINGS['MRF_SHORT_TO_FULL']
-        ALL_MRF_FULL = MAPPINGS['ALL_MRF_FULL']
-        
-        if mrf_value is None:
-            return None
-        v = str(mrf_value).strip()
-        if v in MRF_FULL_TO_SHORT.values():
-            return v
-        if v in MRF_FULL_TO_SHORT:
-            return MRF_FULL_TO_SHORT[v]
-        v_lower = v.lower()
-        for full, short in MRF_FULL_TO_SHORT.items():
-            if full.lower() == v_lower or short.lower() == v_lower:
-                return short
-        return v
-    
-    def _rf_to_report_mrf(self, rf_value):
-        """По названию филиала определить МРФ в формате отчёта."""
-        global MAPPINGS
-        RF_TO_MRF = MAPPINGS['RF_TO_MRF']
-        MRF_FULL_TO_SHORT = MAPPINGS['MRF_FULL_TO_SHORT']
-        
-        rf = str(rf_value).strip() if rf_value else ''
-        if rf in RF_TO_MRF:
-            full_mrf = RF_TO_MRF[rf]
-            return MRF_FULL_TO_SHORT.get(full_mrf, full_mrf)
-        return None
-
-
-# ─────────────────────────────────────────────
-#  2. ЗАГРУЗКА МЭППИНГОВ
+#  1. ЗАГРУЗКА МЭППИНГОВ
 # ─────────────────────────────────────────────
 
 def load_mappings():
@@ -313,11 +66,10 @@ FILL_YELLOW = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='s
 
 
 # ─────────────────────────────────────────────
-#  3. УТИЛИТЫ
+#  2. УТИЛИТЫ
 # ─────────────────────────────────────────────
 
 def find_column_ci(columns, target):
-    """case-insensitive поиск колонки по имени."""
     target_lower = str(target).strip().lower()
     for c in columns:
         if str(c).strip().lower() == target_lower:
@@ -326,7 +78,6 @@ def find_column_ci(columns, target):
 
 
 def find_column_contains_ci(columns, substrings):
-    """Поиск колонки, содержащей ВСЕ указанные подстроки."""
     subs = [s.strip().lower() for s in substrings]
     for c in columns:
         cl = str(c).strip().lower()
@@ -404,17 +155,207 @@ def safe_float(val, default=0.0):
         return default
 
 
+def calc_fact_effect(accrual_report, ap_before, ap_after):
+    """Расчёт фактического эффекта для одного абонента."""
+    if ap_before > 0:
+        delta = accrual_report - ap_before
+        return max(0.0, delta)
+    else:
+        if abs(accrual_report - ap_after) < 0.01:
+            return max(0.0, ap_after - ap_before)
+        elif accrual_report > ap_before:
+            return max(0.0, accrual_report - ap_before)
+        else:
+            return 0.0
+
+
 def timestamp_str():
     return datetime.now().strftime('%H:%M:%S')
 
 
 # ─────────────────────────────────────────────
-#  4. ОБРАБОТКА ОТЧЁТА (openpyxl)
+#  3. ПОТОК ДЛЯ РАСЧЁТА
+# ─────────────────────────────────────────────
+
+class CalculationThread(QThread):
+    """Поток для выполнения расчётов без блокировки GUI"""
+    
+    progress_updated = pyqtSignal(int, str)
+    log_message = pyqtSignal(str)
+    calculation_finished = pyqtSignal(dict, dict)
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, df_base, col_mapping, accruals_cache, mode, 
+                 filter_dates, filter_services, filter_segments, filter_subsegments,
+                 current_mrf_full):
+        super().__init__()
+        self.df_base = df_base
+        self.col_mapping = col_mapping
+        self.accruals_cache = accruals_cache
+        self.mode = mode
+        self.filter_dates = filter_dates
+        self.filter_services = filter_services
+        self.filter_segments = filter_segments
+        self.filter_subsegments = filter_subsegments
+        self.current_mrf_full = current_mrf_full
+        self._is_running = True
+        
+    def stop(self):
+        self._is_running = False
+        
+    def run(self):
+        try:
+            self.log_message.emit("⏳ Начинаем расчёт в фоновом режиме...")
+            self.progress_updated.emit(5, "Подготовка данных...")
+            
+            results, stats = self._process_base()
+            
+            if not self._is_running:
+                self.log_message.emit("⚠️ Расчёт был остановлен пользователем")
+                return
+                
+            self.progress_updated.emit(100, "Расчёт завершён!")
+            self.calculation_finished.emit(results, stats)
+            
+        except Exception as e:
+            import traceback
+            error_msg = f"Ошибка в потоке расчёта:\n{traceback.format_exc()}"
+            self.error_occurred.emit(error_msg)
+            
+    def _process_base(self):
+        """Обработка базы с прогрессом"""
+        results = defaultdict(float)
+        stats = {'total_rows': 0, 'processed': 0, 'no_accrual': 0, 'zero_effect': 0}
+        
+        col_mapping = self.col_mapping
+        df_base = self.df_base
+        accruals_dict = self.accruals_cache
+        mode = self.mode
+        filter_dates = self.filter_dates
+        filter_services = self.filter_services
+        filter_segments = self.filter_segments
+        filter_subsegments = self.filter_subsegments
+        
+        col_msisdn = col_mapping['msisdn']
+        col_ap_before = col_mapping['ap_before']
+        col_ap_after = col_mapping.get('ap_after', '')
+        col_date = col_mapping.get('date', '')
+        col_service = col_mapping.get('service', '')
+        col_percent = col_mapping.get('percent', '')
+        col_mrf = col_mapping.get('mrf', '')
+        col_rf = col_mapping.get('rf', '')
+        col_segment = col_mapping.get('short_segment', '')
+        col_subsegment = col_mapping.get('subsegment', '')
+        col_accrual = col_mapping.get('accrual_report', '')
+        
+        total_rows = len(df_base)
+        stats['total_rows'] = total_rows
+        
+        progress_step = max(1, total_rows // 20)
+        
+        for idx, row in df_base.iterrows():
+            if not self._is_running:
+                return {}, stats
+                
+            msisdn = str(row.get(col_msisdn, '')).strip()
+            if not msisdn:
+                continue
+
+            ap_before = safe_float(row.get(col_ap_before, 0))
+            ap_after = safe_float(row.get(col_ap_after, 0)) if col_ap_after else 0.0
+
+            date_val = str(row.get(col_date, '')).strip() if col_date else ''
+            service_val = str(row.get(col_service, '')).strip() if col_service else ''
+            percent_val = str(row.get(col_percent, '')).strip() if col_percent else ''
+            mrf_val = str(row.get(col_mrf, '')).strip() if col_mrf else ''
+            rf_val = str(row.get(col_rf, '')).strip() if col_rf else ''
+            segment_val = str(row.get(col_segment, '')).strip() if col_segment else ''
+            subsegment_val = str(row.get(col_subsegment, '')).strip() if col_subsegment else ''
+
+            if filter_dates and date_val not in filter_dates:
+                continue
+            if filter_services and service_val not in filter_services:
+                continue
+            if filter_segments and segment_val not in filter_segments:
+                continue
+            if filter_subsegments and subsegment_val not in filter_subsegments:
+                continue
+
+            if mode == 'A':
+                msisdn_key = msisdn
+                accrual_report = accruals_dict.get(msisdn_key)
+                if accrual_report is None:
+                    if msisdn.startswith('8') and len(msisdn) == 11:
+                        accrual_report = accruals_dict.get('7' + msisdn[1:])
+                    elif msisdn.startswith('7') and len(msisdn) == 11:
+                        accrual_report = accruals_dict.get('8' + msisdn[1:])
+                    if accrual_report is None:
+                        if len(msisdn) >= 10:
+                            accrual_report = accruals_dict.get(msisdn[-10:])
+                if accrual_report is None:
+                    accrual_report = 0.0
+                    stats['no_accrual'] += 1
+            else:
+                accrual_report = safe_float(row.get(col_accrual, 0)) if col_accrual else 0.0
+
+            mrf_report = normalize_mrf_to_report(mrf_val)
+            if not mrf_report and rf_val:
+                mrf_report = rf_to_report_mrf(rf_val)
+            if not mrf_report:
+                mrf_report = mrf_val
+
+            effect = calc_fact_effect(accrual_report, ap_before, ap_after)
+
+            if effect == 0:
+                stats['zero_effect'] += 1
+
+            key = (service_val, date_val, percent_val, mrf_report, rf_val, segment_val, subsegment_val)
+            results[key] += effect
+            stats['processed'] += 1
+            
+            if idx % progress_step == 0 and idx > 0:
+                percent = int((idx / total_rows) * 100)
+                self.progress_updated.emit(percent, f"Обработано {idx}/{total_rows} строк...")
+                
+        return dict(results), stats
+
+
+# ─────────────────────────────────────────────
+#  4. ПОТОК ДЛЯ ЗАГРУЗКИ ФАЙЛОВ
+# ─────────────────────────────────────────────
+
+class FileLoadThread(QThread):
+    progress_updated = pyqtSignal(str)
+    file_loaded = pyqtSignal(pd.DataFrame, str)
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, filepath, sheet_name='Лист1'):
+        super().__init__()
+        self.filepath = filepath
+        self.sheet_name = sheet_name
+        self._is_running = True
+        
+    def stop(self):
+        self._is_running = False
+        
+    def run(self):
+        try:
+            if not self._is_running:
+                return
+            self.progress_updated.emit(f"⏳ Загрузка {os.path.basename(self.filepath)}...")
+            df = pd.read_excel(self.filepath, sheet_name=self.sheet_name, engine='openpyxl')
+            if not self._is_running:
+                return
+            self.file_loaded.emit(df, os.path.basename(self.filepath))
+        except Exception as e:
+            self.error_occurred.emit(str(e))
+
+
+# ─────────────────────────────────────────────
+#  5. ОБРАБОТКА ОТЧЁТА (openpyxl)
 # ─────────────────────────────────────────────
 
 class ReportHandler:
-    """Работа с файлом отчёта через openpyxl."""
-
     def __init__(self, filepath):
         self.filepath = filepath
         self.wb = load_workbook(filepath)
@@ -428,11 +369,11 @@ class ReportHandler:
         self.header_row = 1
         self.col_map = {}
         self.target_col = None
-        self._row_cache = {}  # Кеш для быстрого поиска строк
+        self._row_cache = {}
+        self._target_cache = {}
         self._parse_headers()
 
     def _parse_headers(self):
-        """Разобрать заголовки и найти колонки."""
         headers = {}
         for col_idx in range(1, self.ws.max_column + 1):
             val = self.ws.cell(row=self.header_row, column=col_idx).value
@@ -470,23 +411,16 @@ class ReportHandler:
                 self.col_map[role] = best_match
 
     def find_target_column(self, month_name):
-        """Найти колонку «ФАКТ Эффект ... [месяц] 2026»."""
-        # Сначала проверяем кеш
         cache_key = f"target_{month_name}"
-        if hasattr(self, '_target_cache') and cache_key in self._target_cache:
+        if cache_key in self._target_cache:
             return self._target_cache[cache_key]
-        
-        if not hasattr(self, '_target_cache'):
-            self._target_cache = {}
             
         for col_idx in range(1, self.ws.max_column + 1):
             val = self.ws.cell(row=self.header_row, column=col_idx).value
             if val is None:
                 continue
             header = str(val).strip().lower()
-            if ('факт' in header and
-                    month_name.lower() in header and
-                    '2026' in header):
+            if ('факт' in header and month_name.lower() in header and '2026' in header):
                 self.target_col = col_idx
                 self._target_cache[cache_key] = col_idx
                 return col_idx
@@ -496,19 +430,14 @@ class ReportHandler:
             if val is None:
                 continue
             header = str(val).strip().lower()
-            if ('эффект' in header and
-                    month_name.lower() in header and
-                    '2026' in header):
+            if ('эффект' in header and month_name.lower() in header and '2026' in header):
                 self.target_col = col_idx
                 self._target_cache[cache_key] = col_idx
                 return col_idx
         return None
 
     def find_matching_row(self, key):
-        """Найти строку в отчёте с использованием кеша."""
-        # Создаём строковый ключ для кеша
         cache_key = '|'.join(str(v) for v in key if v)
-        
         if cache_key in self._row_cache:
             return self._row_cache[cache_key]
         
@@ -517,7 +446,6 @@ class ReportHandler:
         return row_idx
 
     def _find_matching_row_slow(self, key):
-        """Медленный поиск строки (используется для заполнения кеша)."""
         service, date_val, percent_val, mrf_report, rf_val, segment, subsegment = key
 
         col_service = self.col_map.get('service')
@@ -545,11 +473,7 @@ class ReportHandler:
                 if col_idx is None:
                     continue
                 cell_val = self.ws.cell(row=row_idx, column=col_idx).value
-                if cell_val is None:
-                    cell_str = ''
-                else:
-                    cell_str = str(cell_val).strip()
-
+                cell_str = str(cell_val).strip() if cell_val is not None else ''
                 target_str = str(target_val).strip() if target_val else ''
 
                 if not self._values_match(cell_str, target_str):
@@ -562,7 +486,6 @@ class ReportHandler:
         return None
 
     def _values_match(self, cell_val, target_val):
-        """Гибкое сравнение значений ячеек."""
         if not cell_val and not target_val:
             return True
         if not cell_val or not target_val:
@@ -598,7 +521,6 @@ class ReportHandler:
         return False
 
     def write_results(self, results_dict, month_name, log_callback=None):
-        """Записать результаты в отчёт."""
         target_col = self.find_target_column(month_name)
         if target_col is None:
             raise ValueError(
@@ -640,7 +562,6 @@ class ReportHandler:
         return stats
 
     def _write_new_row(self, row_idx, key, target_col, effect_thousands):
-        """Записать новую строку в отчёт."""
         service, date_val, percent_val, mrf_report, rf_val, segment, subsegment = key
 
         field_map = {
@@ -668,16 +589,14 @@ class ReportHandler:
             cell.fill = FILL_BLUE
 
     def save(self):
-        """Сохранить отчёт."""
         self.wb.save(self.filepath)
 
     def close(self):
-        """Закрыть workbook."""
         self.wb.close()
 
 
 # ─────────────────────────────────────────────
-#  5. GUI — ГЛАВНОЕ ОКНО
+#  6. GUI — ГЛАВНОЕ ОКНО
 # ─────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -693,34 +612,22 @@ class MainWindow(QMainWindow):
         self.mode = 'A'
         self.selected_mrf_list = []
 
-        # Per-MRF state
         self.current_mrf_idx = 0
         self.current_mrf_full = None
 
-        # Base data
         self.df_base = None
         self.base_columns = []
         self.base_file_paths = []
 
-        # Accruals cache
         self.accruals_cache = {}
         self.accruals_file_name = ''
         self._df_accruals = None
 
-        # Column mapping
         self.col_mapping = {}
 
-        # Filters
-        self.available_dates = []
-        self.available_services = []
-        self.available_segments = []
-        self.available_subsegments = []
-
-        # Threads
         self.calculation_thread = None
         self.load_thread = None
 
-        # Log file
         self.log_file = None
         log_dir = os.path.dirname(os.path.abspath(__file__))
         log_path = os.path.join(log_dir, 'indexation_log.txt')
@@ -734,7 +641,6 @@ class MainWindow(QMainWindow):
         self._log('Программа запущена.')
 
     def _build_ui(self):
-        """Построить интерфейс."""
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
@@ -744,7 +650,7 @@ class MainWindow(QMainWindow):
         scroll_widget = QWidget()
         scroll_layout = QVBoxLayout(scroll_widget)
 
-        # === Группа 1: Глобальные настройки ===
+        # Группа 1: Глобальные настройки
         grp_global = QGroupBox('1. Глобальные настройки')
         lay_global = QGridLayout()
 
@@ -775,7 +681,7 @@ class MainWindow(QMainWindow):
         grp_global.setLayout(lay_global)
         scroll_layout.addWidget(grp_global)
 
-        # === Группа 2: Выбор МРФ ===
+        # Группа 2: Выбор МРФ
         grp_mrf = QGroupBox('2. Макрорегионы (отметьте нужные)')
         lay_mrf = QGridLayout()
         self.chk_mrf = {}
@@ -794,7 +700,7 @@ class MainWindow(QMainWindow):
         grp_mrf.setLayout(lay_mrf)
         scroll_layout.addWidget(grp_mrf)
 
-        # === Группа 3: Обработка МРФ ===
+        # Группа 3: Обработка МРФ
         grp_process = QGroupBox('3. Обработка МРФ — загрузка баз и начислений')
         lay_process = QGridLayout()
 
@@ -835,7 +741,7 @@ class MainWindow(QMainWindow):
         grp_process.setLayout(lay_process)
         scroll_layout.addWidget(grp_process)
 
-        # === Группа 4: Маппинг колонок ===
+        # Группа 4: Маппинг колонок
         grp_mapping = QGroupBox('4. Маппинг колонок базы индексации')
         lay_mapping = QGridLayout()
 
@@ -890,7 +796,7 @@ class MainWindow(QMainWindow):
         grp_mapping.setLayout(lay_mapping)
         scroll_layout.addWidget(grp_mapping)
 
-        # === Группа 5: Фильтры ===
+        # Группа 5: Фильтры
         grp_filters = QGroupBox('5. Фильтры (отметьте нужные значения)')
         lay_filters = QVBoxLayout()
 
@@ -934,7 +840,7 @@ class MainWindow(QMainWindow):
         grp_filters.setLayout(lay_filters)
         scroll_layout.addWidget(grp_filters)
 
-        # === Кнопка расчёта ===
+        # Кнопка расчёта
         self.btn_calculate = QPushButton('🔢 РАССЧИТАТЬ ФАКТИЧЕСКИЙ ЭФФЕКТ')
         self.btn_calculate.clicked.connect(self._calculate)
         self.btn_calculate.setEnabled(False)
@@ -944,7 +850,7 @@ class MainWindow(QMainWindow):
         )
         scroll_layout.addWidget(self.btn_calculate)
 
-        # === Прогресс-бар ===
+        # Прогресс-бар
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         self.progress_bar.setMinimum(0)
@@ -958,14 +864,14 @@ class MainWindow(QMainWindow):
         progress_layout.addWidget(self.progress_bar)
         scroll_layout.addLayout(progress_layout)
 
-        # === Кнопка остановки ===
+        # Кнопка остановки
         self.btn_stop_calculation = QPushButton("⏹ Остановить расчёт")
         self.btn_stop_calculation.clicked.connect(self._stop_calculation)
         self.btn_stop_calculation.setEnabled(False)
         self.btn_stop_calculation.setStyleSheet("background-color: #f44336; color: white;")
         scroll_layout.addWidget(self.btn_stop_calculation)
 
-        # === Кнопка следующий МРФ ===
+        # Навигация
         lay_nav = QHBoxLayout()
         self.btn_next_mrf = QPushButton('Следующий МРФ ▶')
         self.btn_next_mrf.clicked.connect(self._next_mrf)
@@ -980,7 +886,7 @@ class MainWindow(QMainWindow):
         lay_nav.addWidget(self.btn_save_report)
         scroll_layout.addLayout(lay_nav)
 
-        # === Журнал ===
+        # Журнал
         grp_log = QGroupBox('Журнал операций')
         lay_log = QVBoxLayout()
         self.txt_log = QTextEdit()
@@ -1052,14 +958,11 @@ class MainWindow(QMainWindow):
             self._log(f'  Лист: {self.report_handler.sheet_name}')
             self._log(f'  Найдены колонки: {list(self.report_handler.col_map.keys())}')
 
-            target = self.report_handler.find_target_column(
-                self.cmb_month.currentText()
-            )
+            target = self.report_handler.find_target_column(self.cmb_month.currentText())
             if target:
                 self._log(f'  Целевая колонка (ФАКТ): #{target}')
             else:
-                self._log(f'  ⚠ Целевая колонка для месяца '
-                          f'«{self.cmb_month.currentText()}» не найдена.')
+                self._log(f'  ⚠ Целевая колонка для месяца «{self.cmb_month.currentText()}» не найдена.')
         except Exception as e:
             self._log(f'✗ Ошибка загрузки отчёта: {e}')
             QMessageBox.critical(self, 'Ошибка', f'Не удалось загрузить отчёт:\n{e}')
@@ -1145,15 +1048,13 @@ class MainWindow(QMainWindow):
         if not path:
             return
 
-        # Показываем прогресс
         self.progress_bar.setVisible(True)
         self.progress_label.setVisible(True)
         self.progress_label.setText("Загрузка файла...")
-        self.progress_bar.setRange(0, 0)  # Бесконечный прогресс
+        self.progress_bar.setRange(0, 0)
         self.btn_load_base.setEnabled(False)
         self.btn_load_more_base.setEnabled(False)
 
-        # Запускаем поток загрузки
         self.load_thread = FileLoadThread(path)
         self.load_thread.progress_updated.connect(self._log)
         self.load_thread.file_loaded.connect(self._on_base_loaded)
@@ -1161,7 +1062,6 @@ class MainWindow(QMainWindow):
         self.load_thread.start()
 
     def _on_base_loaded(self, df, filename):
-        """Обработка загруженной базы"""
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(100)
         
@@ -1172,7 +1072,6 @@ class MainWindow(QMainWindow):
         else:
             self.df_base = df
         
-        # Сохраняем полный путь
         full_path = self.load_thread.filepath if hasattr(self.load_thread, 'filepath') else ''
         if full_path:
             self.base_file_paths.append(full_path)
@@ -1332,7 +1231,6 @@ class MainWindow(QMainWindow):
             QApplication.processEvents()
             t0 = time.time()
 
-            # Загружаем через наш поток
             self.load_thread = FileLoadThread(path)
             self.load_thread.file_loaded.connect(self._on_accruals_loaded)
             self.load_thread.error_occurred.connect(self._on_load_error)
@@ -1344,7 +1242,6 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, 'Ошибка', f'Не удалось загрузить начисления:\n{e}')
 
     def _on_accruals_loaded(self, df, filename):
-        """Обработка загруженных начислений"""
         self._df_accruals = df
         self._log(f'  Начисления загружены: {len(df)} строк')
         
@@ -1376,7 +1273,6 @@ class MainWindow(QMainWindow):
             if idx >= 0:
                 self.cmb_accrual_value.setCurrentIndex(idx)
 
-        # Автоматически строим кеш
         msisdn_col_name = self.cmb_accrual_msisdn.currentText()
         value_col_name = self.cmb_accrual_value.currentText()
         
@@ -1465,29 +1361,23 @@ class MainWindow(QMainWindow):
             return None
         return set(checked)
 
-    # ─── РАСЧЁТ В ФОНОВОМ ПОТОКЕ ───
-
     def _calculate(self):
-        """Запустить расчёт фактического эффекта в отдельном потоке"""
         if self.report_handler is None:
             QMessageBox.warning(self, 'Внимание', 'Загрузите файл отчёта.')
             return
 
         try:
-            # Блокируем кнопки на время расчёта
             self.btn_calculate.setEnabled(False)
             self.btn_load_base.setEnabled(False)
             self.btn_load_accruals.setEnabled(False)
             self.btn_next_mrf.setEnabled(False)
             self.btn_stop_calculation.setEnabled(True)
             
-            # Показываем прогресс-бар
             self.progress_bar.setVisible(True)
             self.progress_label.setVisible(True)
             self.progress_bar.setValue(0)
             self.progress_label.setText("Подготовка к расчёту...")
             
-            # Собираем маппинг колонок
             col_mapping = {}
             for role, cmb in self.cmb_mapping.items():
                 if cmb.currentIndex() > 0:
@@ -1517,7 +1407,6 @@ class MainWindow(QMainWindow):
             df_filtered = self._filter_base_by_mrf(self.df_base, col_mapping)
             self._log(f'  Строк в базе после фильтрации по МРФ: {len(df_filtered)} из {len(self.df_base)}')
 
-            # Создаём и запускаем поток
             self.calculation_thread = CalculationThread(
                 df_base=df_filtered,
                 col_mapping=col_mapping,
@@ -1526,7 +1415,8 @@ class MainWindow(QMainWindow):
                 filter_dates=filter_dates,
                 filter_services=filter_services,
                 filter_segments=filter_segments,
-                filter_subsegments=filter_subsegments
+                filter_subsegments=filter_subsegments,
+                current_mrf_full=self.current_mrf_full
             )
             
             self.calculation_thread.progress_updated.connect(self._on_progress_updated)
@@ -1544,7 +1434,6 @@ class MainWindow(QMainWindow):
             self._enable_buttons_after_calculation()
 
     def _stop_calculation(self):
-        """Остановить текущий расчёт"""
         if hasattr(self, 'calculation_thread') and self.calculation_thread and self.calculation_thread.isRunning():
             self._log('⚠️ Пользователь остановил расчёт')
             self.calculation_thread.stop()
@@ -1553,14 +1442,12 @@ class MainWindow(QMainWindow):
             self._hide_progress()
 
     def _on_progress_updated(self, percent, message):
-        """Обновление прогресса"""
         self.progress_bar.setValue(percent)
         self.progress_label.setText(message)
         if percent % 10 == 0:
             self._log(f'⏳ {message} ({percent}%)')
 
     def _on_calculation_finished(self, results, stats):
-        """Обработка завершения расчёта"""
         self._log('')
         self._log('=' * 50)
         self._log(f'✓ Расчёт завершён в фоновом режиме!')
@@ -1598,14 +1485,12 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(3000, self._hide_progress)
 
     def _on_calculation_error(self, error_msg):
-        """Обработка ошибки в потоке"""
         self._log(f'✗ Ошибка: {error_msg}')
         QMessageBox.critical(self, 'Ошибка расчёта', error_msg)
         self._enable_buttons_after_calculation()
         self._hide_progress()
 
     def _enable_buttons_after_calculation(self):
-        """Восстановить состояние кнопок после расчёта"""
         self.btn_calculate.setEnabled(True)
         self.btn_load_base.setEnabled(True)
         if self.mode == 'A':
@@ -1613,7 +1498,6 @@ class MainWindow(QMainWindow):
         self.btn_stop_calculation.setEnabled(False)
         
     def _hide_progress(self):
-        """Скрыть прогресс-бар"""
         self.progress_bar.setVisible(False)
         self.progress_label.setVisible(False)
         self.progress_bar.setValue(0)
@@ -1690,7 +1574,7 @@ class MainWindow(QMainWindow):
 
 
 # ─────────────────────────────────────────────
-#  6. ТОЧКА ВХОДА
+#  7. ТОЧКА ВХОДА
 # ─────────────────────────────────────────────
 
 def main():
