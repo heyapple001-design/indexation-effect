@@ -1,25 +1,115 @@
-for i in range(len(df)):
-    msn_raw = msisdn_arr[i]
-    if pd.isna(msn_raw) or msn_raw == '':
-        accrual_arr[i] = 0.0
-        continue
-    
-    # Гарантированное преобразование в строку и очистка
-    msn = str(msn_raw).strip()
-    if msn.endswith('.0'):  # Убираем .0 у чисел с плавающей точкой
-        msn = msn[:-2]
-    
-    val = accruals.get(msn)
-    if val is None:
-        # Теперь msn — строка, можно использовать startswith
-        if msn.startswith('8') and len(msn) == 11:
-            val = accruals.get('7' + msn[1:])
-        if val is None and msn.startswith('7') and len(msn) == 11:
-            val = accruals.get('8' + msn[1:])
-        if val is None and len(msn) >= 10:
-            val = accruals.get(msn[-10:])
-    if val is not None:
-        accrual_arr[i] = val
-    else:
-        accrual_arr[i] = 0.0
-        no_accrual_count += 1
+def run(self):
+    try:
+        self.progress.emit('Расчёт фактического эффекта...')
+        df = self.df_base
+        cm = self.col_mapping
+        results = defaultdict(float)
+        stats = {
+            'total_rows': len(df),
+            'processed': 0,
+            'no_accrual': 0,
+            'zero_effect': 0,
+        }
+
+        col_msisdn = cm['msisdn']
+        col_ap_before = cm['ap_before']
+        col_ap_after = cm.get('ap_after', '')
+        col_date = cm.get('date', '')
+        col_service = cm.get('service', '')
+        col_percent = cm.get('percent', '')
+        col_mrf = cm.get('mrf', '')
+        col_rf = cm.get('rf', '')
+        col_segment = cm.get('short_segment', '')
+        col_subsegment = cm.get('subsegment', '')
+        col_accrual = cm.get('accrual_report', '')
+
+        # Векторизованная подготовка данных
+        msisdn_arr = df[col_msisdn].astype(str).str.strip().values
+
+        ap_before_raw = df[col_ap_before]
+        ap_before_arr = pd.to_numeric(
+            ap_before_raw.astype(str)
+                .str.replace(',', '.', regex=False)
+                .str.replace(' ', '', regex=False),
+            errors='coerce'
+        ).fillna(0.0).values
+
+        if col_ap_after and col_ap_after in df.columns:
+            ap_after_arr = pd.to_numeric(
+                df[col_ap_after].astype(str)
+                    .str.replace(',', '.', regex=False)
+                    .str.replace(' ', '', regex=False),
+                errors='coerce'
+            ).fillna(0.0).values
+        else:
+            ap_after_arr = np.zeros(len(df))
+
+        date_arr = df[col_date].astype(str).str.strip().values if col_date and col_date in df.columns else np.array([''] * len(df))
+        service_arr = df[col_service].astype(str).str.strip().values if col_service and col_service in df.columns else np.array([''] * len(df))
+        percent_arr = df[col_percent].astype(str).str.strip().values if col_percent and col_percent in df.columns else np.array([''] * len(df))
+        mrf_arr = df[col_mrf].astype(str).str.strip().values if col_mrf and col_mrf in df.columns else np.array([''] * len(df))
+        rf_arr = df[col_rf].astype(str).str.strip().values if col_rf and col_rf in df.columns else np.array([''] * len(df))
+        seg_arr = df[col_segment].astype(str).str.strip().values if col_segment and col_segment in df.columns else np.array([''] * len(df))
+        subseg_arr = df[col_subsegment].astype(str).str.strip().values if col_subsegment and col_subsegment in df.columns else np.array([''] * len(df))
+
+        # === ИСПРАВЛЕННАЯ ЧАСТЬ: обработка начислений ===
+        if self.mode == 'A':
+            accruals = self.accruals_dict
+            accrual_arr = np.zeros(len(df))
+            no_accrual_count = 0
+            
+            for i in range(len(df)):
+                # Получаем MSISDN как строку
+                msn_raw = msisdn_arr[i]
+                
+                # Пропускаем пустые значения
+                if msn_raw == '' or msn_raw == 'nan' or msn_raw == 'None':
+                    accrual_arr[i] = 0.0
+                    continue
+                
+                # ГЛАВНОЕ ИСПРАВЛЕНИЕ: преобразуем в строку и чистим
+                msn = str(msn_raw).strip()
+                
+                # Убираем .0 у чисел с плавающей точкой
+                if msn.endswith('.0'):
+                    msn = msn[:-2]
+                
+                # Ищем в кеше
+                val = accruals.get(msn)
+                
+                # Если не нашли, пробуем альтернативные форматы
+                if val is None:
+                    # Теперь msn точно строка, можно использовать startswith
+                    if msn.startswith('8') and len(msn) == 11:
+                        val = accruals.get('7' + msn[1:])
+                    if val is None and msn.startswith('7') and len(msn) == 11:
+                        val = accruals.get('8' + msn[1:])
+                    if val is None and len(msn) >= 10:
+                        val = accruals.get(msn[-10:])
+                
+                if val is not None:
+                    accrual_arr[i] = val
+                else:
+                    accrual_arr[i] = 0.0
+                    no_accrual_count += 1
+            
+            stats['no_accrual'] = no_accrual_count
+        else:
+            # Режим Б
+            if col_accrual and col_accrual in df.columns:
+                accrual_arr = pd.to_numeric(
+                    df[col_accrual].astype(str)
+                        .str.replace(',', '.', regex=False)
+                        .str.replace(' ', '', regex=False),
+                    errors='coerce'
+                ).fillna(0.0).values
+            else:
+                accrual_arr = np.zeros(len(df))
+
+        # Остальной код метода run() без изменений...
+        # (фильтры, расчет эффекта, агрегация)
+        
+        valid_mask = np.ones(len(df), dtype=bool)
+        valid_mask &= (msisdn_arr != '') & (msisdn_arr != 'nan')
+
+        # ... продолжение вашего существующего кода ...
