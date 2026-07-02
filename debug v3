@@ -1,0 +1,25 @@
+for i in range(len(df)):
+    msn_raw = msisdn_arr[i]
+    if pd.isna(msn_raw) or msn_raw == '':
+        accrual_arr[i] = 0.0
+        continue
+    
+    # Гарантированное преобразование в строку и очистка
+    msn = str(msn_raw).strip()
+    if msn.endswith('.0'):  # Убираем .0 у чисел с плавающей точкой
+        msn = msn[:-2]
+    
+    val = accruals.get(msn)
+    if val is None:
+        # Теперь msn — строка, можно использовать startswith
+        if msn.startswith('8') and len(msn) == 11:
+            val = accruals.get('7' + msn[1:])
+        if val is None and msn.startswith('7') and len(msn) == 11:
+            val = accruals.get('8' + msn[1:])
+        if val is None and len(msn) >= 10:
+            val = accruals.get(msn[-10:])
+    if val is not None:
+        accrual_arr[i] = val
+    else:
+        accrual_arr[i] = 0.0
+        no_accrual_count += 1
