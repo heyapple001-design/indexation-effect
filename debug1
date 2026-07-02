@@ -1,0 +1,114 @@
+from PyQt5.QtCore import QThread, pyqtSignal
+
+class CalculationThread(QThread):
+    """Поток для выполнения тяжёлых расчётов без блокировки GUI"""
+    
+    # Сигналы для обновления интерфейса
+    progress_updated = pyqtSignal(int, str)  # (процент, сообщение)
+    log_message = pyqtSignal(str)
+    calculation_finished = pyqtSignal(dict, dict)  # (results, stats)
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, df_base, col_mapping, accruals_cache, mode, 
+                 filter_dates, filter_services, filter_segments, filter_subsegments):
+        super().__init__()
+        self.df_base = df_base
+        self.col_mapping = col_mapping
+        self.accruals_cache = accruals_cache
+        self.mode = mode
+        self.filter_dates = filter_dates
+        self.filter_services = filter_services
+        self.filter_segments = filter_segments
+        self.filter_subsegments = filter_subsegments
+        self._is_running = True
+        
+    def stop(self):
+        """Остановить выполнение"""
+        self._is_running = False
+        
+    def run(self):
+        """Запуск расчёта в отдельном потоке"""
+        try:
+            self.log_message.emit("⏳ Начинаем расчёт в фоновом режиме...")
+            
+            # Эмуляция прогресса (реальный прогресс будет внутри process_base)
+            self.progress_updated.emit(10, "Подготовка данных...")
+            
+            # Вызываем модифицированную версию process_base с поддержкой прогресса
+            results, stats = self._process_base_with_progress(
+                df_base=self.df_base,
+                col_mapping=self.col_mapping,
+                accruals_dict=self.accruals_cache if self.mode == 'A' else {},
+                mode=self.mode,
+                filter_dates=self.filter_dates,
+                filter_services=self.filter_services,
+                filter_segments=self.filter_segments,
+                filter_subsegments=self.filter_subsegments
+            )
+            
+            if not self._is_running:
+                self.log_message.emit("⚠️ Расчёт был остановлен пользователем")
+                return
+                
+            self.progress_updated.emit(100, "Расчёт завершён!")
+            self.calculation_finished.emit(results, stats)
+            
+        except Exception as e:
+            import traceback
+            error_msg = f"Ошибка в потоке расчёта:\n{traceback.format_exc()}"
+            self.error_occurred.emit(error_msg)
+            
+    def _process_base_with_progress(self, **kwargs):
+        """Модифицированная версия process_base с поддержкой прогресса"""
+        df_base = kwargs['df_base']
+        col_mapping = kwargs['col_mapping']
+        accruals_dict = kwargs['accruals_dict']
+        mode = kwargs['mode']
+        filter_dates = kwargs['filter_dates']
+        filter_services = kwargs['filter_services']
+        filter_segments = kwargs['filter_segments']
+        filter_subsegments = kwargs['filter_subsegments']
+        
+        results = defaultdict(float)
+        stats = {'total_rows': 0, 'processed': 0, 'no_accrual': 0, 'zero_effect': 0}
+        
+        # --- ВСЕ ВАШИ ПЕРЕМЕННЫЕ col_* ОСТАЮТСЯ ТЕМИ ЖЕ ---
+        col_msisdn = col_mapping['msisdn']
+        col_ap_before = col_mapping['ap_before']
+        col_ap_after = col_mapping.get('ap_after', '')
+        col_date = col_mapping.get('date', '')
+        col_service = col_mapping.get('service', '')
+        col_percent = col_mapping.get('percent', '')
+        col_mrf = col_mapping.get('mrf', '')
+        col_rf = col_mapping.get('rf', '')
+        col_segment = col_mapping.get('short_segment', '')
+        col_subsegment = col_mapping.get('subsegment', '')
+        col_accrual = col_mapping.get('accrual_report', '')
+        
+        total_rows = len(df_base)
+        stats['total_rows'] = total_rows
+        
+        # Отправляем прогресс каждые 5% или каждые 1000 строк
+        progress_step = max(1, total_rows // 20)  # 20 шагов = 5% каждый
+        
+        for idx, row in df_base.iterrows():
+            # Проверка на остановку
+            if not self._is_running:
+                return {}, stats
+                
+            # --- ВЕСЬ ОСТАЛЬНОЙ КОД process_base ОСТАЁТСЯ БЕЗ ИЗМЕНЕНИЙ ---
+            # (всё от получения msisdn до расчёта effect)
+            
+            # Получаем значения (код идентичен вашему)
+            msisdn = str(row.get(col_msisdn, '')).strip()
+            if not msisdn:
+                continue
+                
+            # ... (весь ваш код обработки строки) ...
+            
+            # Отправляем прогресс
+            if idx % progress_step == 0:
+                percent = int((idx / total_rows) * 100)
+                self.progress_updated.emit(percent, f"Обработано {idx}/{total_rows} строк...")
+                
+        return dict(results), stats
