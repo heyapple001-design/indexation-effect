@@ -1,0 +1,154 @@
+def _calculate(self):
+    """Запустить расчёт фактического эффекта в отдельном потоке"""
+    if self.report_handler is None:
+        QMessageBox.warning(self, 'Внимание', 'Загрузите файл отчёта.')
+        return
+
+    try:
+        # Блокируем кнопки на время расчёта
+        self.btn_calculate.setEnabled(False)
+        self.btn_load_base.setEnabled(False)
+        self.btn_load_accruals.setEnabled(False)
+        self.btn_next_mrf.setEnabled(False)
+        self.btn_stop_calculation.setEnabled(True)
+        
+        # Показываем прогресс-бар
+        self.progress_bar.setVisible(True)
+        self.progress_label.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.progress_label.setText("Подготовка к расчёту...")
+        
+        # Собираем маппинг колонок (как в вашем коде)
+        col_mapping = {}
+        for role, cmb in self.cmb_mapping.items():
+            if cmb.currentIndex() > 0:
+                col_mapping[role] = cmb.currentText()
+            else:
+                col_mapping[role] = ''
+
+        if self.mode == 'B':
+            if self.cmb_accrual_col_b.currentIndex() > 0:
+                col_mapping['accrual_report'] = self.cmb_accrual_col_b.currentText()
+            else:
+                self._log('✗ Не выбрана колонка начислений за отчётный месяц (режим Б)')
+                return
+
+        # Проверка обязательных колонок (как в вашем коде)
+        if not col_mapping.get('msisdn'):
+            self._log('✗ Не выбрана колонка MSISDN')
+            return
+        if not col_mapping.get('ap_before'):
+            self._log('✗ Не выбрана колонка АП до')
+            return
+
+        # Фильтры
+        filter_dates = self._get_filter_values(self.chk_dates)
+        filter_services = self._get_filter_values(self.chk_services)
+        filter_segments = self._get_filter_values(self.chk_segments)
+        filter_subsegments = self._get_filter_values(self.chk_subsegments)
+
+        # Фильтрация по МРФ
+        df_filtered = self._filter_base_by_mrf(self.df_base, col_mapping)
+        self._log(f'  Строк в базе после фильтрации по МРФ: {len(df_filtered)} из {len(self.df_base)}')
+
+        # Создаём и запускаем поток
+        self.calculation_thread = CalculationThread(
+            df_base=df_filtered,
+            col_mapping=col_mapping,
+            accruals_cache=self.accruals_cache if self.mode == 'A' else {},
+            mode=self.mode,
+            filter_dates=filter_dates,
+            filter_services=filter_services,
+            filter_segments=filter_segments,
+            filter_subsegments=filter_subsegments
+        )
+        
+        # Подключаем сигналы
+        self.calculation_thread.progress_updated.connect(self._on_progress_updated)
+        self.calculation_thread.log_message.connect(self._log)
+        self.calculation_thread.calculation_finished.connect(self._on_calculation_finished)
+        self.calculation_thread.error_occurred.connect(self._on_calculation_error)
+        
+        self._log('▶ Запуск расчёта в фоновом потоке...')
+        self.calculation_thread.start()
+        
+    except Exception as e:
+        self._log(f'✗ Ошибка при запуске расчёта: {e}')
+        import traceback
+        traceback.print_exc()
+        self._enable_buttons_after_calculation()
+
+def _stop_calculation(self):
+    """Остановить текущий расчёт"""
+    if hasattr(self, 'calculation_thread') and self.calculation_thread.isRunning():
+        self._log('⚠️ Пользователь остановил расчёт')
+        self.calculation_thread.stop()
+        self.calculation_thread.wait()  # Ждём завершения потока
+        self._enable_buttons_after_calculation()
+        self.progress_bar.setVisible(False)
+        self.progress_label.setVisible(False)
+
+def _on_progress_updated(self, percent, message):
+    """Обновление прогресса"""
+    self.progress_bar.setValue(percent)
+    self.progress_label.setText(message)
+    # Обновляем статус в логе каждые 10%
+    if percent % 10 == 0:
+        self._log(f'⏳ {message} ({percent}%)')
+
+def _on_calculation_finished(self, results, stats):
+    """Обработка завершения расчёта"""
+    self._log('')
+    self._log('=' * 50)
+    self._log(f'✓ Расчёт завершён в фоновом режиме!')
+    self._log(f'  Обработано строк: {stats["processed"]} из {stats["total_rows"]}')
+    self._log(f'  Не найдено начислений: {stats["no_accrual"]}')
+    self._log(f'  Нулевой эффект: {stats["zero_effect"]}')
+    self._log(f'  Уникальных комбинаций: {len(results)}')
+    
+    if len(results) == 0:
+        self._log('⚠ Нет данных для записи.')
+        self._enable_buttons_after_calculation()
+        return
+    
+    # Запись в отчёт (этот процесс тоже может быть долгим, но пока оставим)
+    self._log('⏳ Запись результатов в отчёт...')
+    month_name = self.cmb_month.currentText()
+    write_stats = self.report_handler.write_results(
+        results, month_name, log_callback=self._log
+    )
+    
+    # Общий итог
+    total_effect = sum(results.values()) / 1000.0
+    self._log(f'  ИТОГО эффект: {total_effect:.2f} тыс.руб. без НДС')
+    self._log(f'  Обновлено строк: {write_stats["updated_rows"]}')
+    self._log(f'  Добавлено строк: {write_stats["added_rows"]}')
+    self._log(f'  Зелёных (эффект > 0): {write_stats["written"]}')
+    self._log(f'  Жёлтых (нет данных): {write_stats["yellow_cells"]}')
+    
+    self.btn_next_mrf.setEnabled(True)
+    self.btn_save_report.setEnabled(True)
+    self._enable_buttons_after_calculation()
+    
+    # Скрываем прогресс-бар через 3 секунды
+    QTimer.singleShot(3000, self._hide_progress)
+
+def _on_calculation_error(self, error_msg):
+    """Обработка ошибки в потоке"""
+    self._log(f'✗ Ошибка: {error_msg}')
+    QMessageBox.critical(self, 'Ошибка расчёта', error_msg)
+    self._enable_buttons_after_calculation()
+
+def _enable_buttons_after_calculation(self):
+    """Восстановить состояние кнопок после расчёта"""
+    self.btn_calculate.setEnabled(True)
+    self.btn_load_base.setEnabled(True)
+    if self.mode == 'A':
+        self.btn_load_accruals.setEnabled(True)
+    self.btn_stop_calculation.setEnabled(False)
+    
+def _hide_progress(self):
+    """Скрыть прогресс-бар"""
+    self.progress_bar.setVisible(False)
+    self.progress_label.setVisible(False)
+    self.progress_bar.setValue(0)
