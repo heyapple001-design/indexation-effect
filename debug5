@@ -1,0 +1,51 @@
+def _load_base(self):
+    path, _ = QFileDialog.getOpenFileName(...)
+    if not path:
+        return
+    
+    # Показываем прогресс
+    self.progress_bar.setVisible(True)
+    self.progress_label.setVisible(True)
+    self.progress_label.setText("Загрузка файла...")
+    self.progress_bar.setRange(0, 0)  # Бесконечный прогресс
+    
+    # Запускаем поток загрузки
+    self.load_thread = FileLoadThread(path)
+    self.load_thread.progress_updated.connect(self._log)
+    self.load_thread.file_loaded.connect(self._on_base_loaded)
+    self.load_thread.error_occurred.connect(self._on_load_error)
+    self.load_thread.start()
+
+def _on_base_loaded(self, df, filename):
+    """Обработка загруженной базы"""
+    self.progress_bar.setRange(0, 100)
+    self.progress_bar.setValue(100)
+    
+    self._log(f'✓ Загружено строк: {len(df)}, колонок: {len(df.columns)}')
+    
+    if self.df_base is not None:
+        self.df_base = pd.concat([self.df_base, df], ignore_index=True)
+    else:
+        self.df_base = df
+    
+    self.base_file_paths.append(filename)  # нужно хранить полный путь
+    self.base_columns = list(self.df_base.columns)
+    
+    # Обновляем интерфейс
+    names = [os.path.basename(p) for p in self.base_file_paths]
+    self.lbl_base_files.setText(', '.join(names))
+    self.lbl_base_files.setStyleSheet('color: green;')
+    
+    self._populate_column_combos()
+    self._populate_filters()
+    self.btn_load_more_base.setEnabled(True)
+    self._check_ready_to_calculate()
+    
+    # Скрываем прогресс
+    QTimer.singleShot(1000, self._hide_progress)
+
+def _on_load_error(self, error_msg):
+    """Обработка ошибки загрузки"""
+    self._log(f'✗ Ошибка загрузки: {error_msg}')
+    QMessageBox.critical(self, 'Ошибка', f'Не удалось загрузить файл:\n{error_msg}')
+    self._hide_progress()
