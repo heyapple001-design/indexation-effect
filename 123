@@ -1,0 +1,1731 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Расчёт фактического эффекта от индексации тарифов.
+GUI на PyQt5, совместимо с запуском из IDLE.
+Версия 2 — с async-загрузкой и vectorized-расчётами.
+"""
+
+import sys
+import os
+import json
+import time
+import traceback
+from datetime import datetime
+from collections import defaultdict
+
+import pandas as pd
+import numpy as np
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QGridLayout, QLabel, QComboBox, QPushButton, QCheckBox,
+    QFileDialog, QTextEdit, QGroupBox, QRadioButton, QButtonGroup,
+    QScrollArea, QFrame, QMessageBox, QProgressBar, QSplitter,
+    QSizePolicy
+)
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
+from PyQt5.QtGui import QFont, QColor
+
+
+# ─────────────────────────────────────────────
+#  1. ЗАГРУЗКА МЭППИНГОВ
+# ─────────────────────────────────────────────
+
+def load_mappings():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    mappings_path = os.path.join(script_dir, 'mappings.json')
+    if not os.path.exists(mappings_path):
+        mappings_path = 'mappings.json'
+    with open(mappings_path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+
+MAPPINGS = load_mappings()
+
+ALL_MRF_FULL = MAPPINGS['ALL_MRF_FULL']
+MRF_FULL_TO_SHORT = MAPPINGS['MRF_FULL_TO_SHORT']
+MRF_SHORT_TO_FULL = MAPPINGS['MRF_SHORT_TO_FULL']
+MRF_TO_RF = MAPPINGS['MRF_TO_RF']
+RF_TO_MRF = MAPPINGS['RF_TO_MRF']
+SERVICES = MAPPINGS['SERVICES']
+SHORT_SEGMENTS = MAPPINGS['SHORT_SEGMENTS']
+SUBSEGMENTS = MAPPINGS['SUBSEGMENTS']
+
+MONTHS = [
+    'Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь',
+    'Июль', 'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'
+]
+
+FILL_BLUE = PatternFill(start_color='99CCFF', end_color='99CCFF', fill_type='solid')
+FILL_GREEN = PatternFill(start_color='92D050', end_color='92D050', fill_type='solid')
+FILL_YELLOW = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')
+
+
+# ─────────────────────────────────────────────
+#  2. УТИЛИТЫ
+# ─────────────────────────────────────────────
+
+def find_column_ci(columns, target):
+    target_lower = str(target).strip().lower()
+    for c in columns:
+        if str(c).strip().lower() == target_lower:
+            return c
+    return None
+
+
+def find_column_contains_ci(columns, substrings):
+    subs = [s.strip().lower() for s in substrings]
+    for c in columns:
+        cl = str(c).strip().lower()
+        if all(s in cl for s in subs):
+            return c
+    return None
+
+
+def normalize_mrf_to_report(mrf_value):
+    if mrf_value is None:
+        return None
+    v = str(mrf_value).strip()
+    if v in MRF_FULL_TO_SHORT.values():
+        return v
+    if v in MRF_FULL_TO_SHORT:
+        return MRF_FULL_TO_SHORT[v]
+    v_lower = v.lower()
+    for full, short in MRF_FULL_TO_SHORT.items():
+        if full.lower() == v_lower or short.lower() == v_lower:
+            return short
+    return v
+
+
+def normalize_mrf_to_full(mrf_value):
+    if mrf_value is None:
+        return None
+    v = str(mrf_value).strip()
+    if v in MRF_SHORT_TO_FULL:
+        return MRF_SHORT_TO_FULL[v]
+    if v in MRF_FULL_TO_SHORT:
+        return v
+    v_lower = v.lower()
+    for full_name in ALL_MRF_FULL:
+        if full_name.lower() == v_lower:
+            return full_name
+    return v
+
+
+def rf_to_report_mrf(rf_value):
+    if rf_value is None:
+        return None
+    rf = str(rf_value).strip()
+    if rf in RF_TO_MRF:
+        full_mrf = RF_TO_MRF[rf]
+        return MRF_FULL_TO_SHORT.get(full_mrf, full_mrf)
+    return None
+
+
+def safe_float(val, default=0.0):
+    if val is None:
+        return default
+    try:
+        v = float(str(val).replace(',', '.').replace(' ', '').strip())
+        return v
+    except (ValueError, TypeError):
+        return default
+
+
+def timestamp_str():
+    return datetime.now().strftime('%H:%M:%S')
+
+
+# ─────────────────────────────────────────────
+#  3. ASYNC WORKERS (QThread)
+# ─────────────────────────────────────────────
+
+class ExcelLoadWorker(QObject):
+    """Воркер для загрузки Excel-файла в отдельном потоке."""
+    finished = pyqtSignal(object, str)      # (DataFrame, sheet_name)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(str)              # текстовый статус
+
+    def __init__(self, filepath, sheet_name):
+        super().__init__()
+        self.filepath = filepath
+        self.sheet_name = sheet_name
+
+    def run(self):
+        try:
+            self.progress.emit(f'Чтение файла: {os.path.basename(self.filepath)}...')
+            df = pd.read_excel(
+                self.filepath,
+                sheet_name=self.sheet_name,
+                engine='openpyxl',
+            )
+            self.finished.emit(df, self.sheet_name)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class AccrualsCacheWorker(QObject):
+    """Воркер для построения кеша начислений (vectorized)."""
+    finished = pyqtSignal(dict, int)   # (cache_dict, count)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, df, msisdn_col, value_col):
+        super().__init__()
+        self.df = df
+        self.msisdn_col = msisdn_col
+        self.value_col = value_col
+
+    def run(self):
+        try:
+            self.progress.emit('Построение кеша начислений...')
+            df = self.df
+
+            # Векторизованное построение кеша — в ~100x быстрее iterrows
+            msisdn_series = df[self.msisdn_col].astype(str).str.strip()
+
+            # Преобразуем значения в float векторно
+            value_series = pd.to_numeric(
+                df[self.value_col]
+                    .astype(str)
+                    .str.replace(',', '.', regex=False)
+                    .str.replace(' ', '', regex=False)
+                    .str.strip(),
+                errors='coerce'
+            ).fillna(0.0)
+
+            # Фильтруем пустые MSISDN
+            valid_mask = (msisdn_series != '') & (msisdn_series != 'nan') & (msisdn_series != 'None')
+            msisdn_valid = msisdn_series[valid_mask]
+            value_valid = value_series[valid_mask]
+
+            # Строим dict через zip (vectorized)
+            cache = dict(zip(msisdn_valid.values, value_valid.values))
+
+            self.finished.emit(cache, len(cache))
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class CalculationWorker(QObject):
+    """Воркер для расчёта фактического эффекта (vectorized)."""
+    finished = pyqtSignal(dict, dict)   # (results, stats)
+    error = pyqtSignal(str)
+    progress = pyqtSignal(str)
+
+    def __init__(self, df_base, col_mapping, accruals_dict, mode,
+                 filter_dates, filter_services, filter_segments, filter_subsegments):
+        super().__init__()
+        self.df_base = df_base
+        self.col_mapping = col_mapping
+        self.accruals_dict = accruals_dict
+        self.mode = mode
+        self.filter_dates = filter_dates
+        self.filter_services = filter_services
+        self.filter_segments = filter_segments
+        self.filter_subsegments = filter_subsegments
+
+    def run(self):
+        try:
+            self.progress.emit('Расчёт фактического эффекта...')
+            df = self.df_base
+            cm = self.col_mapping
+            results = defaultdict(float)
+            stats = {
+                'total_rows': len(df),
+                'processed': 0,
+                'no_accrual': 0,
+                'zero_effect': 0,
+            }
+
+            col_msisdn = cm['msisdn']
+            col_ap_before = cm['ap_before']
+            col_ap_after = cm.get('ap_after', '')
+            col_date = cm.get('date', '')
+            col_service = cm.get('service', '')
+            col_percent = cm.get('percent', '')
+            col_mrf = cm.get('mrf', '')
+            col_rf = cm.get('rf', '')
+            col_segment = cm.get('short_segment', '')
+            col_subsegment = cm.get('subsegment', '')
+            col_accrual = cm.get('accrual_report', '')
+
+            # === Векторизованная подготовка данных ===
+            # MSISDN — строка
+            msisdn_arr = df[col_msisdn].astype(str).str.strip().values
+
+            # АП до — float
+            ap_before_raw = df[col_ap_before]
+            ap_before_arr = pd.to_numeric(
+                ap_before_raw.astype(str)
+                    .str.replace(',', '.', regex=False)
+                    .str.replace(' ', '', regex=False),
+                errors='coerce'
+            ).fillna(0.0).values
+
+            # АП после
+            if col_ap_after and col_ap_after in df.columns:
+                ap_after_arr = pd.to_numeric(
+                    df[col_ap_after].astype(str)
+                        .str.replace(',', '.', regex=False)
+                        .str.replace(' ', '', regex=False),
+                    errors='coerce'
+                ).fillna(0.0).values
+            else:
+                ap_after_arr = np.zeros(len(df))
+
+            # Дата, услуга, процент, МРФ, РФ, сегмент, подсегмент — строки
+            date_arr = df[col_date].astype(str).str.strip().values if col_date and col_date in df.columns else np.array([''] * len(df))
+            service_arr = df[col_service].astype(str).str.strip().values if col_service and col_service in df.columns else np.array([''] * len(df))
+            percent_arr = df[col_percent].astype(str).str.strip().values if col_percent and col_percent in df.columns else np.array([''] * len(df))
+            mrf_arr = df[col_mrf].astype(str).str.strip().values if col_mrf and col_mrf in df.columns else np.array([''] * len(df))
+            rf_arr = df[col_rf].astype(str).str.strip().values if col_rf and col_rf in df.columns else np.array([''] * len(df))
+            seg_arr = df[col_segment].astype(str).str.strip().values if col_segment and col_segment in df.columns else np.array([''] * len(df))
+            subseg_arr = df[col_subsegment].astype(str).str.strip().values if col_subsegment and col_subsegment in df.columns else np.array([''] * len(df))
+
+            # Начисления за отчётный месяц
+            if self.mode == 'A':
+                # Lookup из кеша — для каждого MSISDN
+                accruals = self.accruals_dict
+                accrual_arr = np.zeros(len(df))
+                no_accrual_count = 0
+                for i in range(len(df)):
+                    msn = msisdn_arr[i]
+                    if msn == '' or msn == 'nan':
+                        accrual_arr[i] = 0.0
+                        continue
+                    val = accruals.get(msn)
+                    if val is None:
+                        # Пробуем альтернативные форматы
+                        if msn.startswith('8') and len(msn) == 11:
+                            val = accruals.get('7' + msn[1:])
+                        if val is None and msn.startswith('7') and len(msn) == 11:
+                            val = accruals.get('8' + msn[1:])
+                        if val is None and len(msn) >= 10:
+                            val = accruals.get(msn[-10:])
+                    if val is not None:
+                        accrual_arr[i] = val
+                    else:
+                        accrual_arr[i] = 0.0
+                        no_accrual_count += 1
+                stats['no_accrual'] = no_accrual_count
+            else:
+                # Режим Б
+                if col_accrual and col_accrual in df.columns:
+                    accrual_arr = pd.to_numeric(
+                        df[col_accrual].astype(str)
+                            .str.replace(',', '.', regex=False)
+                            .str.replace(' ', '', regex=False),
+                        errors='coerce'
+                    ).fillna(0.0).values
+                else:
+                    accrual_arr = np.zeros(len(df))
+
+            # === Применение фильтров (векторно) ===
+            valid_mask = np.ones(len(df), dtype=bool)
+            valid_mask &= (msisdn_arr != '') & (msisdn_arr != 'nan')
+
+            if self.filter_dates and col_date:
+                mask = np.zeros(len(df), dtype=bool)
+                for d in self.filter_dates:
+                    mask |= (date_arr == d)
+                valid_mask &= mask
+
+            if self.filter_services and col_service:
+                mask = np.zeros(len(df), dtype=bool)
+                for s in self.filter_services:
+                    mask |= (service_arr == s)
+                valid_mask &= mask
+
+            if self.filter_segments and col_segment:
+                mask = np.zeros(len(df), dtype=bool)
+                for s in self.filter_segments:
+                    mask |= (seg_arr == s)
+                valid_mask &= mask
+
+            if self.filter_subsegments and col_subsegment:
+                mask = np.zeros(len(df), dtype=bool)
+                for s in self.filter_subsegments:
+                    mask |= (subseg_arr == s)
+                valid_mask &= mask
+
+            # === Векторный расчёт эффекта ===
+            # Основной случай: ap_before > 0 → max(0, accrual - ap_before)
+            # Специальный: ap_before == 0 → по правилам
+            effect_arr = np.zeros(len(df))
+
+            # Основной случай
+            main_mask = ap_before_arr > 0
+            delta_main = accrual_arr - ap_before_arr
+            effect_arr[main_mask] = np.maximum(0.0, delta_main[main_mask])
+
+            # Специальный случай: ap_before == 0
+            special_mask = ~main_mask & valid_mask
+            # Если начисления == АП после → прогнозный эффект
+            close_to_after = np.abs(accrual_arr - ap_after_arr) < 0.01
+            forecast_effect = ap_after_arr - ap_before_arr  # = ap_after - 0 = ap_after
+            effect_arr[special_mask & close_to_after] = np.maximum(
+                0.0, forecast_effect[special_mask & close_to_after]
+            )
+            # Если начисления > АП до
+            greater_than_before = (accrual_arr > ap_before_arr) & ~close_to_after
+            effect_arr[special_mask & greater_than_before] = np.maximum(
+                0.0, (accrual_arr - ap_before_arr)[special_mask & greater_than_before]
+            )
+
+            # Применяем valid_mask
+            effect_arr[~valid_mask] = 0.0
+
+            # === Приводим МРФ к формату отчёта (векторно через numpy) ===
+            mrf_report_arr = np.array([normalize_mrf_to_report(m) for m in mrf_arr])
+            # Где не удалось — пробуем по РФ
+            empty_mrf = (mrf_report_arr == '') | (mrf_report_arr == 'None') | (mrf_report_arr == None)
+            for i in np.where(empty_mrf)[0]:
+                if rf_arr[i] and rf_arr[i] != 'nan':
+                    r = rf_to_report_mrf(rf_arr[i])
+                    if r:
+                        mrf_report_arr[i] = r
+
+            # === Агрегация (по уникальным комбинациям) ===
+            zero_count = 0
+            processed_count = 0
+            for i in np.where(valid_mask)[0]:
+                key = (
+                    service_arr[i], date_arr[i], percent_arr[i],
+                    mrf_report_arr[i], rf_arr[i], seg_arr[i], subseg_arr[i]
+                )
+                eff = float(effect_arr[i])
+                results[key] += eff
+                processed_count += 1
+                if eff == 0:
+                    zero_count += 1
+
+            stats['processed'] = processed_count
+            stats['zero_effect'] = zero_count
+
+            self.finished.emit(dict(results), stats)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+# ─────────────────────────────────────────────
+#  4. ДВИЖОК РАСЧЁТА (для unit-тестов)
+# ─────────────────────────────────────────────
+
+class CalculationEngine:
+    """Расчёт фактического эффекта для одного абонента (для unit-тестов)."""
+
+    @staticmethod
+    def calc_fact_effect(accrual_report, ap_before, ap_after):
+        if ap_before > 0:
+            delta = accrual_report - ap_before
+            return max(0.0, delta)
+        else:
+            if abs(accrual_report - ap_after) < 0.01:
+                return max(0.0, ap_after - ap_before)
+            elif accrual_report > ap_before:
+                return max(0.0, accrual_report - ap_before)
+            else:
+                return 0.0
+
+    @staticmethod
+    def process_base(df_base, col_mapping, accruals_dict, mode='A',
+                     filter_dates=None, filter_services=None,
+                     filter_segments=None, filter_subsegments=None):
+        """Оригинальный iterrows-метод (для unit-тестов с малыми данными)."""
+        results = defaultdict(float)
+        stats = {'total_rows': 0, 'processed': 0, 'no_accrual': 0, 'zero_effect': 0}
+
+        col_msisdn = col_mapping['msisdn']
+        col_ap_before = col_mapping['ap_before']
+        col_ap_after = col_mapping.get('ap_after', '')
+        col_date = col_mapping.get('date', '')
+        col_service = col_mapping.get('service', '')
+        col_percent = col_mapping.get('percent', '')
+        col_mrf = col_mapping.get('mrf', '')
+        col_rf = col_mapping.get('rf', '')
+        col_segment = col_mapping.get('short_segment', '')
+        col_subsegment = col_mapping.get('subsegment', '')
+        col_accrual = col_mapping.get('accrual_report', '')
+
+        for idx, row in df_base.iterrows():
+            stats['total_rows'] += 1
+            msisdn = str(row.get(col_msisdn, '')).strip()
+            if not msisdn:
+                continue
+            ap_before = safe_float(row.get(col_ap_before, 0))
+            ap_after = safe_float(row.get(col_ap_after, 0)) if col_ap_after else 0.0
+            date_val = str(row.get(col_date, '')).strip() if col_date else ''
+            service_val = str(row.get(col_service, '')).strip() if col_service else ''
+            percent_val = str(row.get(col_percent, '')).strip() if col_percent else ''
+            mrf_val = str(row.get(col_mrf, '')).strip() if col_mrf else ''
+            rf_val = str(row.get(col_rf, '')).strip() if col_rf else ''
+            segment_val = str(row.get(col_segment, '')).strip() if col_segment else ''
+            subsegment_val = str(row.get(col_subsegment, '')).strip() if col_subsegment else ''
+
+            if filter_dates and date_val not in filter_dates:
+                continue
+            if filter_services and service_val not in filter_services:
+                continue
+            if filter_segments and segment_val not in filter_segments:
+                continue
+            if filter_subsegments and subsegment_val not in filter_subsegments:
+                continue
+
+            if mode == 'A':
+                accrual_report = accruals_dict.get(msisdn)
+                if accrual_report is None:
+                    if msisdn.startswith('8') and len(msisdn) == 11:
+                        accrual_report = accruals_dict.get('7' + msisdn[1:])
+                    if accrual_report is None and msisdn.startswith('7') and len(msisdn) == 11:
+                        accrual_report = accruals_dict.get('8' + msisdn[1:])
+                    if accrual_report is None and len(msisdn) >= 10:
+                        accrual_report = accruals_dict.get(msisdn[-10:])
+                if accrual_report is None:
+                    accrual_report = 0.0
+                    stats['no_accrual'] += 1
+            else:
+                accrual_report = safe_float(row.get(col_accrual, 0)) if col_accrual else 0.0
+
+            mrf_report = normalize_mrf_to_report(mrf_val)
+            if not mrf_report and rf_val:
+                mrf_report = rf_to_report_mrf(rf_val)
+            if not mrf_report:
+                mrf_report = mrf_val
+
+            effect = CalculationEngine.calc_fact_effect(accrual_report, ap_before, ap_after)
+            if effect == 0:
+                stats['zero_effect'] += 1
+
+            key = (service_val, date_val, percent_val, mrf_report, rf_val, segment_val, subsegment_val)
+            results[key] += effect
+            stats['processed'] += 1
+
+        return dict(results), stats
+
+
+# ─────────────────────────────────────────────
+#  5. ОБРАБОТКА ОТЧЁТА (openpyxl)
+# ─────────────────────────────────────────────
+
+class ReportHandler:
+    """Работа с файлом отчёта через openpyxl."""
+
+    def __init__(self, filepath):
+        self.filepath = filepath
+        self.wb = load_workbook(filepath)
+        self.sheet_name = 'Факт-эффект индексации 2026'
+        if self.sheet_name not in self.wb.sheetnames:
+            for name in self.wb.sheetnames:
+                if 'факт' in name.lower() and 'индекс' in name.lower():
+                    self.sheet_name = name
+                    break
+        self.ws = self.wb[self.sheet_name]
+        self.header_row = 1
+        self.col_map = {}
+        self.target_col = None
+        self._parse_headers()
+
+    def _parse_headers(self):
+        headers = {}
+        for col_idx in range(1, self.ws.max_column + 1):
+            val = self.ws.cell(row=self.header_row, column=col_idx).value
+            if val is not None:
+                headers[col_idx] = str(val).strip()
+
+        key_names = {
+            'service': ['услуга'],
+            'date': ['дата индексации', 'дата'],
+            'percent': ['процент индексации', 'процент'],
+            'mrf': ['мрф', 'макрорегион'],
+            'rf': ['рф'],
+            'short_segment': ['краткий сегмент', 'сегмент'],
+            'subsegment': ['подсегмент'],
+        }
+
+        for role, search_terms in key_names.items():
+            best_match = None
+            best_score = -1
+            for col_idx, header_text in headers.items():
+                hl = header_text.lower()
+                for term in search_terms:
+                    tl = term.lower()
+                    if tl in hl:
+                        score = 100 - abs(len(hl) - len(tl))
+                        if role == 'rf' and 'мрф' in hl and 'м' not in tl:
+                            score = -1
+                        if score > best_score:
+                            best_score = score
+                            best_match = col_idx
+                        break
+            if best_match is not None and best_score > 0:
+                self.col_map[role] = best_match
+
+    def find_target_column(self, month_name):
+        for col_idx in range(1, self.ws.max_column + 1):
+            val = self.ws.cell(row=self.header_row, column=col_idx).value
+            if val is None:
+                continue
+            header = str(val).strip().lower()
+            if ('факт' in header and month_name.lower() in header and '2026' in header):
+                self.target_col = col_idx
+                return col_idx
+        for col_idx in range(1, self.ws.max_column + 1):
+            val = self.ws.cell(row=self.header_row, column=col_idx).value
+            if val is None:
+                continue
+            header = str(val).strip().lower()
+            if ('эффект' in header and month_name.lower() in header and '2026' in header):
+                self.target_col = col_idx
+                return col_idx
+        return None
+
+    def find_matching_row(self, key):
+        service, date_val, percent_val, mrf_report, rf_val, segment, subsegment = key
+        col_service = self.col_map.get('service')
+        col_date = self.col_map.get('date')
+        col_percent = self.col_map.get('percent')
+        col_mrf = self.col_map.get('mrf')
+        col_rf = self.col_map.get('rf')
+        col_segment = self.col_map.get('short_segment')
+        col_subsegment = self.col_map.get('subsegment')
+
+        for row_idx in range(2, self.ws.max_row + 1):
+            match = True
+            checks = [
+                (col_service, service), (col_date, date_val),
+                (col_percent, percent_val), (col_mrf, mrf_report),
+                (col_rf, rf_val), (col_segment, segment),
+                (col_subsegment, subsegment),
+            ]
+            for col_idx, target_val in checks:
+                if col_idx is None:
+                    continue
+                cell_val = self.ws.cell(row=row_idx, column=col_idx).value
+                cell_str = str(cell_val).strip() if cell_val is not None else ''
+                target_str = str(target_val).strip() if target_val else ''
+                if not self._values_match(cell_str, target_str):
+                    match = False
+                    break
+            if match:
+                return row_idx
+        return None
+
+    def _values_match(self, cell_val, target_val):
+        if not cell_val and not target_val:
+            return True
+        if not cell_val or not target_val:
+            return False
+        cv = cell_val.strip().lower()
+        tv = target_val.strip().lower()
+        if cv == tv:
+            return True
+        try:
+            cv_num = float(cv.replace(',', '.').replace('%', '').replace(' ', ''))
+            tv_num = float(tv.replace(',', '.').replace('%', '').replace(' ', ''))
+            if abs(cv_num - tv_num) < 0.001:
+                return True
+        except (ValueError, TypeError):
+            pass
+        if cv in MRF_FULL_TO_SHORT and MRF_FULL_TO_SHORT[cv] == tv:
+            return True
+        if tv in MRF_FULL_TO_SHORT and MRF_FULL_TO_SHORT[tv] == cv:
+            return True
+        if cv in MRF_SHORT_TO_FULL and MRF_SHORT_TO_FULL[cv].lower() == tv:
+            return True
+        if tv in MRF_SHORT_TO_FULL and MRF_SHORT_TO_FULL[tv].lower() == cv:
+            return True
+        if len(cv) > 3 and len(tv) > 3:
+            if cv in tv or tv in cv:
+                return True
+        return False
+
+    def write_results(self, results_dict, month_name, log_callback=None):
+        target_col = self.find_target_column(month_name)
+        if target_col is None:
+            raise ValueError(
+                f"Не найдена колонка «ФАКТ Эффект от индексации тыс.руб. без НДС "
+                f"{month_name} 2026» в отчёте."
+            )
+        stats = {'written': 0, 'added_rows': 0, 'updated_rows': 0, 'yellow_cells': 0}
+
+        for key, effect_rub in results_dict.items():
+            effect_thousands = effect_rub / 1000.0
+            row_idx = self.find_matching_row(key)
+            if row_idx is not None:
+                cell = self.ws.cell(row=row_idx, column=target_col)
+                cell.value = round(effect_thousands, 2)
+                stats['updated_rows'] += 1
+                if effect_thousands > 0:
+                    cell.fill = FILL_GREEN
+                    stats['written'] += 1
+                else:
+                    cell.fill = FILL_YELLOW
+                    stats['yellow_cells'] += 1
+            else:
+                new_row = self.ws.max_row + 1
+                self._write_new_row(new_row, key, target_col, effect_thousands)
+                stats['added_rows'] += 1
+                if effect_thousands > 0:
+                    stats['written'] += 1
+
+            if log_callback:
+                service, date_val, percent_val, mrf_report, rf_val, seg, subseg = key
+                log_callback(
+                    f"  Записано: {service} | {rf_val} | {seg} | {subseg} | "
+                    f"эффект={effect_thousands:.2f} тыс.руб."
+                )
+        return stats
+
+    def _write_new_row(self, row_idx, key, target_col, effect_thousands):
+        service, date_val, percent_val, mrf_report, rf_val, segment, subsegment = key
+        field_map = {
+            'service': service, 'date': date_val, 'percent': percent_val,
+            'mrf': mrf_report, 'rf': rf_val,
+            'short_segment': segment, 'subsegment': subsegment,
+        }
+        for role, value in field_map.items():
+            col_idx = self.col_map.get(role)
+            if col_idx is not None:
+                cell = self.ws.cell(row=row_idx, column=col_idx)
+                cell.value = value
+                cell.fill = FILL_BLUE
+        cell = self.ws.cell(row=row_idx, column=target_col)
+        cell.value = round(effect_thousands, 2)
+        if effect_thousands > 0:
+            cell.fill = FILL_GREEN
+        else:
+            cell.fill = FILL_BLUE
+
+    def save(self):
+        self.wb.save(self.filepath)
+
+    def close(self):
+        self.wb.close()
+
+
+# ─────────────────────────────────────────────
+#  6. GUI — ГЛАВНОЕ ОКНО
+# ─────────────────────────────────────────────
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle('Расчёт фактического эффекта от индексации тарифов')
+        self.setMinimumSize(1100, 850)
+
+        # Состояние
+        self.report_path = None
+        self.report_handler = None
+        self.selected_month = None
+        self.mode = 'A'
+        self.selected_mrf_list = []
+        self.current_mrf_idx = 0
+        self.current_mrf_full = None
+
+        # Base data
+        self.df_base = None
+        self.base_columns = []
+        self.base_file_paths = []
+
+        # Accruals
+        self.accruals_cache = {}
+        self.accruals_file_name = ''
+        self._df_accruals = None  # DataFrame начислений для пересборки
+
+        # Workers (чтобы GC не собрал)
+        self._worker = None
+        self._worker_thread = None
+
+        # Busy flag
+        self._busy = False
+
+        # Log file
+        self.log_file = None
+        log_dir = os.path.dirname(os.path.abspath(__file__))
+        log_path = os.path.join(log_dir, 'indexation_log.txt')
+        try:
+            self.log_file = open(log_path, 'a', encoding='utf-8')
+        except:
+            pass
+
+        self._build_ui()
+        self._update_visibility()
+        self._log('Программа запущена.')
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_widget = QWidget()
+        scroll_layout = QVBoxLayout(scroll_widget)
+
+        # === Группа 1: Глобальные настройки ===
+        grp_global = QGroupBox('1. Глобальные настройки')
+        lay_global = QGridLayout()
+
+        lay_global.addWidget(QLabel('Отчётный месяц:'), 0, 0)
+        self.cmb_month = QComboBox()
+        self.cmb_month.addItems(MONTHS)
+        self.cmb_month.setCurrentIndex(0)
+        lay_global.addWidget(self.cmb_month, 0, 1)
+
+        lay_global.addWidget(QLabel('Режим:'), 0, 2)
+        mode_layout = QHBoxLayout()
+        self.rb_mode_a = QRadioButton('А (отдельный файл начислений)')
+        self.rb_mode_b = QRadioButton('Б (начисления в базе)')
+        self.rb_mode_a.setChecked(True)
+        self.rb_mode_a.toggled.connect(self._on_mode_changed)
+        mode_layout.addWidget(self.rb_mode_a)
+        mode_layout.addWidget(self.rb_mode_b)
+        lay_global.addLayout(mode_layout, 0, 3)
+
+        lay_global.addWidget(QLabel('Файл отчёта:'), 1, 0)
+        self.lbl_report_file = QLabel('не загружен')
+        self.lbl_report_file.setStyleSheet('color: gray;')
+        lay_global.addWidget(self.lbl_report_file, 1, 1, 1, 2)
+        btn_report = QPushButton('Выбрать отчёт...')
+        btn_report.clicked.connect(self._load_report)
+        lay_global.addWidget(btn_report, 1, 3)
+
+        grp_global.setLayout(lay_global)
+        scroll_layout.addWidget(grp_global)
+
+        # === Группа 2: Выбор МРФ ===
+        grp_mrf = QGroupBox('2. Макрорегионы (отметьте нужные)')
+        lay_mrf = QGridLayout()
+        self.chk_mrf = {}
+        for i, mrf in enumerate(ALL_MRF_FULL):
+            cb = QCheckBox(mrf)
+            self.chk_mrf[mrf] = cb
+            lay_mrf.addWidget(cb, i // 4, i % 4)
+        btn_select_all_mrf = QPushButton('Выбрать все')
+        btn_select_all_mrf.clicked.connect(self._select_all_mrf)
+        lay_mrf.addWidget(btn_select_all_mrf, 2, 0)
+        btn_deselect_all_mrf = QPushButton('Снять все')
+        btn_deselect_all_mrf.clicked.connect(self._deselect_all_mrf)
+        lay_mrf.addWidget(btn_deselect_all_mrf, 2, 1)
+        grp_mrf.setLayout(lay_mrf)
+        scroll_layout.addWidget(grp_mrf)
+
+        # === Группа 3: Обработка МРФ ===
+        grp_process = QGroupBox('3. Обработка МРФ — загрузка баз и начислений')
+        lay_process = QGridLayout()
+
+        self.lbl_current_mrf = QLabel('МРФ не выбран')
+        self.lbl_current_mrf.setStyleSheet('font-weight: bold; font-size: 13px;')
+        lay_process.addWidget(self.lbl_current_mrf, 0, 0, 1, 4)
+
+        self.btn_start_mrf = QPushButton('▶ Начать обработку выбранных МРФ')
+        self.btn_start_mrf.clicked.connect(self._start_mrf_processing)
+        self.btn_start_mrf.setStyleSheet(
+            'background-color: #4CAF50; color: white; padding: 8px; font-size: 13px;')
+        lay_process.addWidget(self.btn_start_mrf, 1, 0, 1, 4)
+
+        lay_process.addWidget(QLabel('База индексации:'), 2, 0)
+        self.lbl_base_files = QLabel('не загружена')
+        self.lbl_base_files.setWordWrap(True)
+        lay_process.addWidget(self.lbl_base_files, 2, 1, 1, 2)
+        self.btn_load_base = QPushButton('Загрузить базу...')
+        self.btn_load_base.clicked.connect(self._load_base)
+        self.btn_load_base.setEnabled(False)
+        lay_process.addWidget(self.btn_load_base, 2, 3)
+
+        self.btn_load_more_base = QPushButton('Загрузить ещё базу?')
+        self.btn_load_more_base.clicked.connect(self._load_more_base)
+        self.btn_load_more_base.setEnabled(False)
+        lay_process.addWidget(self.btn_load_more_base, 3, 3)
+
+        # Кеш + прогресс-бар
+        self.lbl_cache_status = QLabel('Кеш: пуст')
+        self.lbl_cache_status.setStyleSheet('color: gray;')
+        lay_process.addWidget(self.lbl_cache_status, 4, 0, 1, 2)
+        self.btn_load_accruals = QPushButton('Загрузить начисления...')
+        self.btn_load_accruals.clicked.connect(self._load_accruals)
+        self.btn_load_accruals.setEnabled(False)
+        lay_process.addWidget(self.btn_load_accruals, 4, 2)
+        self.btn_clear_cache = QPushButton('Очистить кеш')
+        self.btn_clear_cache.clicked.connect(self._clear_cache)
+        lay_process.addWidget(self.btn_clear_cache, 4, 3)
+
+        # Прогресс-бар (невидимый по умолчанию)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setRange(0, 0)  # неопределённый прогресс
+        self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat('%v')
+        lay_process.addWidget(self.progress_bar, 5, 0, 1, 4)
+
+        grp_process.setLayout(lay_process)
+        scroll_layout.addWidget(grp_process)
+
+        # === Группа 4: Маппинг колонок ===
+        grp_mapping = QGroupBox('4. Маппинг колонок базы индексации')
+        lay_mapping = QGridLayout()
+
+        self.mapping_roles = [
+            ('msisdn', 'MSISDN (уник. идентификатор)'),
+            ('ap_before', 'Начисления ДО индексации (АП до)'),
+            ('ap_after', 'Начисления ПОСЛЕ индексации (АП после)'),
+            ('date', 'Дата индексации'),
+            ('service', 'Услуга'),
+            ('percent', 'Процент индексации'),
+            ('mrf', 'МРФ'),
+            ('rf', 'РФ (филиал)'),
+            ('short_segment', 'Краткий сегмент'),
+            ('subsegment', 'Подсегмент'),
+        ]
+
+        self.cmb_mapping = {}
+        for i, (role, label) in enumerate(self.mapping_roles):
+            lay_mapping.addWidget(QLabel(label + ':'), i, 0)
+            cmb = QComboBox()
+            cmb.setMinimumWidth(250)
+            self.cmb_mapping[role] = cmb
+            lay_mapping.addWidget(cmb, i, 1)
+
+        self.lbl_accrual_col = QLabel('Начисления за отчётный месяц (режим Б):')
+        self.cmb_accrual_col_b = QComboBox()
+        self.cmb_accrual_col_b.setMinimumWidth(250)
+        lay_mapping.addWidget(self.lbl_accrual_col, len(self.mapping_roles), 0)
+        lay_mapping.addWidget(self.cmb_accrual_col_b, len(self.mapping_roles), 1)
+        self.lbl_accrual_col.setVisible(False)
+        self.cmb_accrual_col_b.setVisible(False)
+
+        self.lbl_sep_accrual = QLabel('─── Маппинг колонок файла начислений ───')
+        self.lbl_sep_accrual.setStyleSheet('font-weight: bold;')
+        row_offset = len(self.mapping_roles) + 1
+        lay_mapping.addWidget(self.lbl_sep_accrual, row_offset, 0, 1, 2)
+
+        lay_mapping.addWidget(QLabel('MSISDN в файле начислений:'), row_offset + 1, 0)
+        self.cmb_accrual_msisdn = QComboBox()
+        self.cmb_accrual_msisdn.setMinimumWidth(250)
+        lay_mapping.addWidget(self.cmb_accrual_msisdn, row_offset + 1, 1)
+
+        lay_mapping.addWidget(QLabel('Начисления за отчётный месяц:'), row_offset + 2, 0)
+        self.cmb_accrual_value = QComboBox()
+        self.cmb_accrual_value.setMinimumWidth(250)
+        lay_mapping.addWidget(self.cmb_accrual_value, row_offset + 2, 1)
+
+        self.btn_rebuild_cache = QPushButton('Пересобрать кеш')
+        self.btn_rebuild_cache.clicked.connect(self._rebuild_cache_from_ui)
+        lay_mapping.addWidget(self.btn_rebuild_cache, row_offset + 3, 0, 1, 2)
+
+        grp_mapping.setLayout(lay_mapping)
+        scroll_layout.addWidget(grp_mapping)
+
+        # === Группа 5: Фильтры ===
+        grp_filters = QGroupBox('5. Фильтры (отметьте нужные значения)')
+        lay_filters = QVBoxLayout()
+
+        lay_dates = QHBoxLayout()
+        lay_dates.addWidget(QLabel('Даты индексации:'))
+        self.filter_dates_layout = QHBoxLayout()
+        self.chk_dates = {}
+        lay_dates.addLayout(self.filter_dates_layout)
+        lay_filters.addLayout(lay_dates)
+
+        lay_services = QHBoxLayout()
+        lay_services.addWidget(QLabel('Услуги:'))
+        self.filter_services_layout = QHBoxLayout()
+        self.chk_services = {}
+        lay_services.addLayout(self.filter_services_layout)
+        lay_filters.addLayout(lay_services)
+
+        lay_segments = QHBoxLayout()
+        lay_segments.addWidget(QLabel('Краткие сегменты:'))
+        self.filter_segments_layout = QHBoxLayout()
+        self.chk_segments = {}
+        lay_segments.addLayout(self.filter_segments_layout)
+        lay_filters.addLayout(lay_segments)
+
+        lay_subsegments = QHBoxLayout()
+        lay_subsegments.addWidget(QLabel('Подсегменты:'))
+        self.filter_subsegments_layout = QHBoxLayout()
+        self.chk_subsegments = {}
+        lay_subsegments.addLayout(self.filter_subsegments_layout)
+        lay_filters.addLayout(lay_subsegments)
+
+        lay_filter_btns = QHBoxLayout()
+        btn_select_all_filters = QPushButton('Выбрать все фильтры')
+        btn_select_all_filters.clicked.connect(self._select_all_filters)
+        lay_filter_btns.addWidget(btn_select_all_filters)
+        btn_deselect_all_filters = QPushButton('Снять все фильтры')
+        btn_deselect_all_filters.clicked.connect(self._deselect_all_filters)
+        lay_filter_btns.addWidget(btn_deselect_all_filters)
+        lay_filters.addLayout(lay_filter_btns)
+
+        grp_filters.setLayout(lay_filters)
+        scroll_layout.addWidget(grp_filters)
+
+        # === Кнопка расчёта ===
+        self.btn_calculate = QPushButton('🔢 РАССЧИТАТЬ ФАКТИЧЕСКИЙ ЭФФЕКТ')
+        self.btn_calculate.clicked.connect(self._calculate)
+        self.btn_calculate.setEnabled(False)
+        self.btn_calculate.setStyleSheet(
+            'background-color: #2196F3; color: white; padding: 12px; '
+            'font-size: 15px; font-weight: bold;')
+        scroll_layout.addWidget(self.btn_calculate)
+
+        # === Кнопка следующий МРФ ===
+        lay_nav = QHBoxLayout()
+        self.btn_next_mrf = QPushButton('Следующий МРФ ▶')
+        self.btn_next_mrf.clicked.connect(self._next_mrf)
+        self.btn_next_mrf.setEnabled(False)
+        self.btn_next_mrf.setStyleSheet(
+            'background-color: #FF9800; color: white; padding: 8px;')
+        lay_nav.addWidget(self.btn_next_mrf)
+
+        self.btn_save_report = QPushButton('💾 Сохранить отчёт')
+        self.btn_save_report.clicked.connect(self._save_report)
+        self.btn_save_report.setEnabled(False)
+        self.btn_save_report.setStyleSheet(
+            'background-color: #9C27B0; color: white; padding: 8px;')
+        lay_nav.addWidget(self.btn_save_report)
+        scroll_layout.addLayout(lay_nav)
+
+        # === Журнал ===
+        grp_log = QGroupBox('Журнал операций')
+        lay_log = QVBoxLayout()
+        self.txt_log = QTextEdit()
+        self.txt_log.setReadOnly(True)
+        self.txt_log.setMaximumHeight(200)
+        self.txt_log.setStyleSheet('font-family: Consolas, monospace; font-size: 11px;')
+        lay_log.addWidget(self.txt_log)
+        grp_log.setLayout(lay_log)
+        scroll_layout.addWidget(grp_log)
+
+        scroll.setWidget(scroll_widget)
+        main_layout.addWidget(scroll)
+
+    # ─── Busy-state helpers ───
+
+    def _set_busy(self, busy, message='Загрузка...'):
+        """Блокировать/разблокировать UI во время операций."""
+        self._busy = busy
+        self.progress_bar.setVisible(busy)
+        self.progress_bar.setFormat(message)
+
+        # Блокируем кнопки
+        for btn in [self.btn_load_base, self.btn_load_more_base,
+                    self.btn_load_accruals, self.btn_clear_cache,
+                    self.btn_calculate, self.btn_next_mrf,
+                    self.btn_save_report, self.btn_start_mrf]:
+            btn.setEnabled(not busy)
+
+        if busy:
+            QApplication.setOverrideCursor(Qt.WaitCursor)
+        else:
+            QApplication.restoreOverrideCursor()
+
+    # ─── Async helpers ───
+
+    def _start_worker(self, worker):
+        """Запустить воркер в отдельном потоке."""
+        self._worker_thread = QThread()
+        self._worker = worker
+        self._worker.moveToThread(self._worker_thread)
+        self._worker_thread.started.connect(self._worker.run)
+        # Сигналы подключаются в вызывающем методе
+        self._worker_thread.start()
+
+    def _cleanup_worker(self):
+        """Завершить поток воркера."""
+        if self._worker_thread is not None:
+            self._worker_thread.quit()
+            self._worker_thread.wait()
+            self._worker_thread = None
+            self._worker = None
+
+    # ─── Обработчики событий ───
+
+    def _on_mode_changed(self):
+        if self.rb_mode_a.isChecked():
+            self.mode = 'A'
+            self._log('Режим переключён: А (отдельный файл начислений)')
+        else:
+            self.mode = 'B'
+            self._log('Режим переключён: Б (начисления в базе индексации)')
+        self._clear_cache()
+        self._update_visibility()
+
+    def _update_visibility(self):
+        is_a = (self.mode == 'A')
+        self.btn_load_accruals.setVisible(is_a)
+        self.lbl_cache_status.setVisible(is_a)
+        self.btn_clear_cache.setVisible(is_a)
+        self.lbl_sep_accrual.setVisible(is_a)
+        self.cmb_accrual_msisdn.setVisible(is_a)
+        self.cmb_accrual_value.setVisible(is_a)
+        self.btn_rebuild_cache.setVisible(is_a)
+        self.lbl_accrual_col.setVisible(not is_a)
+        self.cmb_accrual_col_b.setVisible(not is_a)
+
+    def _select_all_mrf(self):
+        for cb in self.chk_mrf.values():
+            cb.setChecked(True)
+
+    def _deselect_all_mrf(self):
+        for cb in self.chk_mrf.values():
+            cb.setChecked(False)
+
+    def _select_all_filters(self):
+        for d in [self.chk_dates, self.chk_services, self.chk_segments, self.chk_subsegments]:
+            for cb in d.values():
+                cb.setChecked(True)
+
+    def _deselect_all_filters(self):
+        for d in [self.chk_dates, self.chk_services, self.chk_segments, self.chk_subsegments]:
+            for cb in d.values():
+                cb.setChecked(False)
+
+    def _load_report(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Выберите файл отчёта', '',
+            'Excel файлы (*.xlsx *.xls);;Все файлы (*)')
+        if not path:
+            return
+        try:
+            self.report_path = path
+            if self.report_handler:
+                self.report_handler.close()
+
+            self._set_busy(True, 'Загрузка отчёта...')
+            QApplication.processEvents()
+
+            self.report_handler = ReportHandler(path)
+            fname = os.path.basename(path)
+            self.lbl_report_file.setText(fname)
+            self.lbl_report_file.setStyleSheet('color: green; font-weight: bold;')
+            self._log(f'✓ Отчёт загружен: {fname}')
+            self._log(f'  Лист: {self.report_handler.sheet_name}')
+            self._log(f'  Найдены колонки: {list(self.report_handler.col_map.keys())}')
+
+            target = self.report_handler.find_target_column(self.cmb_month.currentText())
+            if target:
+                self._log(f'  Целевая колонка (ФАКТ): #{target}')
+            else:
+                self._log(f'  ⚠ Целевая колонка для месяца '
+                          f'«{self.cmb_month.currentText()}» не найдена.')
+            self._set_busy(False)
+        except Exception as e:
+            self._set_busy(False)
+            self._log(f'✗ Ошибка загрузки отчёта: {e}')
+            QMessageBox.critical(self, 'Ошибка', f'Не удалось загрузить отчёт:\n{e}')
+
+    def _get_selected_mrf_list(self):
+        return [mrf for mrf, cb in self.chk_mrf.items() if cb.isChecked()]
+
+    def _start_mrf_processing(self):
+        if self.report_handler is None:
+            QMessageBox.warning(self, 'Внимание', 'Сначала загрузите файл отчёта.')
+            return
+        self.selected_mrf_list = self._get_selected_mrf_list()
+        if not self.selected_mrf_list:
+            QMessageBox.warning(self, 'Внимание', 'Выберите хотя бы один макрорегион.')
+            return
+        self.current_mrf_idx = 0
+        self._activate_current_mrf()
+
+    def _activate_current_mrf(self):
+        if self.current_mrf_idx >= len(self.selected_mrf_list):
+            self._log('✓ Все МРФ обработаны!')
+            self.lbl_current_mrf.setText('Все МРФ обработаны!')
+            self.btn_calculate.setEnabled(False)
+            self.btn_load_base.setEnabled(False)
+            self.btn_load_accruals.setEnabled(False)
+            self.btn_next_mrf.setEnabled(False)
+            self.btn_save_report.setEnabled(True)
+            return
+
+        self.current_mrf_full = self.selected_mrf_list[self.current_mrf_idx]
+        short = MRF_FULL_TO_SHORT.get(self.current_mrf_full, self.current_mrf_full)
+        self.lbl_current_mrf.setText(
+            f'МРФ: {self.current_mrf_full} ({short}) '
+            f'[{self.current_mrf_idx + 1}/{len(self.selected_mrf_list)}]')
+
+        self.df_base = None
+        self.base_columns = []
+        self.base_file_paths = []
+        self.accruals_cache = {}
+        self.accruals_file_name = ''
+        self._df_accruals = None
+
+        self.lbl_base_files.setText('не загружена')
+        self.lbl_cache_status.setText('Кеш: пуст')
+        self.lbl_cache_status.setStyleSheet('color: gray;')
+        for cmb in self.cmb_mapping.values():
+            cmb.clear()
+        self.cmb_accrual_col_b.clear()
+        self.cmb_accrual_msisdn.clear()
+        self.cmb_accrual_value.clear()
+        self._clear_filter_checkboxes()
+
+        self.btn_load_base.setEnabled(True)
+        self.btn_load_more_base.setEnabled(False)
+        if self.mode == 'A':
+            self.btn_load_accruals.setEnabled(True)
+        self.btn_calculate.setEnabled(False)
+        self.btn_next_mrf.setEnabled(False)
+
+        self._log(f'▶ Начинаем обработку МРФ: {self.current_mrf_full}')
+
+    def _clear_filter_checkboxes(self):
+        for layout in [self.filter_dates_layout, self.filter_services_layout,
+                       self.filter_segments_layout, self.filter_subsegments_layout]:
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.deleteLater()
+        self.chk_dates = {}
+        self.chk_services = {}
+        self.chk_segments = {}
+        self.chk_subsegments = {}
+
+    # ─── Загрузка базы (async) ───
+
+    def _load_base(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, f'База индексации для МРФ «{self.current_mrf_full}»', '',
+            'Excel файлы (*.xlsx *.xls);;Все файлы (*)')
+        if not path:
+            return
+
+        self._log(f'Загрузка базы: {os.path.basename(path)}...')
+        self._set_busy(True, 'Загрузка базы (это может занять время)...')
+        QApplication.processEvents()
+
+        worker = ExcelLoadWorker(path, 'Лист1')
+        worker.progress.connect(lambda msg: self._update_progress(msg))
+        worker.finished.connect(lambda df, sheet: self._on_base_loaded(df, path))
+        worker.error.connect(self._on_base_error)
+        self._start_worker(worker)
+
+    def _on_base_loaded(self, df, path):
+        """Callback после загрузки базы из потока."""
+        self._cleanup_worker()
+        try:
+            self._log(f'  Загружено строк: {len(df)}, колонок: {len(df.columns)}')
+
+            if self.df_base is not None:
+                self.df_base = pd.concat([self.df_base, df], ignore_index=True)
+            else:
+                self.df_base = df
+
+            self.base_file_paths.append(path)
+            self.base_columns = list(self.df_base.columns)
+
+            names = [os.path.basename(p) for p in self.base_file_paths]
+            self.lbl_base_files.setText(', '.join(names))
+            self.lbl_base_files.setStyleSheet('color: green;')
+
+            self._populate_column_combos()
+            self._populate_filters()
+            self.btn_load_more_base.setEnabled(True)
+
+            self._log(f'✓ База загружена: {os.path.basename(path)} '
+                      f'(всего строк в объединённой базе: {len(self.df_base)})')
+            self._check_ready_to_calculate()
+        except Exception as e:
+            self._log(f'✗ Ошибка обработки базы: {e}')
+            traceback.print_exc()
+        finally:
+            self._set_busy(False)
+
+    def _on_base_error(self, error_msg):
+        self._cleanup_worker()
+        self._set_busy(False)
+        self._log(f'✗ Ошибка загрузки базы: {error_msg}')
+        QMessageBox.critical(self, 'Ошибка', f'Не удалось загрузить базу:\n{error_msg}')
+
+    def _load_more_base(self):
+        self._load_base()
+
+    def _populate_column_combos(self):
+        cols = self.base_columns
+        for role, cmb in self.cmb_mapping.items():
+            cmb.clear()
+            cmb.addItem('— не выбрано —')
+            cmb.addItems([str(c) for c in cols])
+            auto = self._auto_select_column(role, cols)
+            if auto:
+                idx = cmb.findText(str(auto))
+                if idx >= 0:
+                    cmb.setCurrentIndex(idx)
+        self.cmb_accrual_col_b.clear()
+        self.cmb_accrual_col_b.addItem('— не выбрано —')
+        self.cmb_accrual_col_b.addItems([str(c) for c in cols])
+
+    def _auto_select_column(self, role, columns):
+        search_map = {
+            'msisdn': ['msisdn', 'мсисден', 'номер'],
+            'ap_before': ['ап до', 'до индексации', 'тариф до', 'начисления до'],
+            'ap_after': ['ап после', 'после индексации', 'тариф после', 'начисления после'],
+            'date': ['дата индексации', 'дата'],
+            'service': ['услуга', 'сервис', 'вид услуги'],
+            'percent': ['процент', '% индексации'],
+            'mrf': ['мрф', 'макрорегион'],
+            'rf': ['рф', 'филиал', 'регион'],
+            'short_segment': ['краткий сегмент', 'сегмент'],
+            'subsegment': ['подсегмент'],
+        }
+        terms = search_map.get(role, [])
+        for term in terms:
+            result = find_column_contains_ci(columns, [term])
+            if result:
+                return result
+        return None
+
+    def _populate_filters(self):
+        self._clear_filter_checkboxes()
+        if self.df_base is None:
+            return
+
+        col_date = self._get_selected_col('date')
+        col_service = self._get_selected_col('service')
+        col_segment = self._get_selected_col('short_segment')
+        col_subsegment = self._get_selected_col('subsegment')
+
+        if col_date and col_date in self.df_base.columns:
+            dates = sorted(self.df_base[col_date].dropna().unique())
+            for d in dates:
+                d_str = str(d).strip()
+                if d_str and d_str != 'nan':
+                    cb = QCheckBox(d_str)
+                    cb.setChecked(True)
+                    self.chk_dates[d_str] = cb
+                    self.filter_dates_layout.addWidget(cb)
+
+        if col_service and col_service in self.df_base.columns:
+            services = sorted(self.df_base[col_service].dropna().unique())
+            for s in services:
+                s_str = str(s).strip()
+                if s_str and s_str != 'nan':
+                    cb = QCheckBox(s_str)
+                    cb.setChecked(True)
+                    self.chk_services[s_str] = cb
+                    self.filter_services_layout.addWidget(cb)
+        else:
+            for s in SERVICES:
+                cb = QCheckBox(s)
+                cb.setChecked(True)
+                self.chk_services[s] = cb
+                self.filter_services_layout.addWidget(cb)
+
+        if col_segment and col_segment in self.df_base.columns:
+            segs = sorted(self.df_base[col_segment].dropna().unique())
+            for s in segs:
+                s_str = str(s).strip()
+                if s_str and s_str != 'nan':
+                    cb = QCheckBox(s_str)
+                    cb.setChecked(True)
+                    self.chk_segments[s_str] = cb
+                    self.filter_segments_layout.addWidget(cb)
+        else:
+            for s in SHORT_SEGMENTS:
+                cb = QCheckBox(s)
+                cb.setChecked(True)
+                self.chk_segments[s] = cb
+                self.filter_segments_layout.addWidget(cb)
+
+        if col_subsegment and col_subsegment in self.df_base.columns:
+            subs = sorted(self.df_base[col_subsegment].dropna().unique())
+            for s in subs:
+                s_str = str(s).strip()
+                if s_str and s_str != 'nan':
+                    cb = QCheckBox(s_str)
+                    cb.setChecked(True)
+                    self.chk_subsegments[s_str] = cb
+                    self.filter_subsegments_layout.addWidget(cb)
+        else:
+            for s in SUBSEGMENTS:
+                cb = QCheckBox(s)
+                cb.setChecked(True)
+                self.chk_subsegments[s] = cb
+                self.filter_subsegments_layout.addWidget(cb)
+
+    def _get_selected_col(self, role):
+        cmb = self.cmb_mapping.get(role)
+        if cmb and cmb.currentIndex() > 0:
+            return cmb.currentText()
+        return None
+
+    # ─── Загрузка начислений (async) ───
+
+    def _load_accruals(self):
+        if self.mode != 'A':
+            return
+
+        path, _ = QFileDialog.getOpenFileName(
+            self, 'Файл начислений (режим А)', '',
+            'Excel файлы (*.xlsx *.xls);;Все файлы (*)')
+        if not path:
+            return
+
+        self._log(f'Загрузка начислений: {os.path.basename(path)}...')
+        self.lbl_cache_status.setText('Кеш: загрузка файла...')
+        self.lbl_cache_status.setStyleSheet('color: orange;')
+        self._set_busy(True, 'Загрузка файла начислений (это может занять 1-2 мин для 300к строк)...')
+        QApplication.processEvents()
+
+        worker = ExcelLoadWorker(path, 'Sheet')
+        worker.progress.connect(lambda msg: self._update_progress(msg))
+        worker.finished.connect(lambda df, sheet: self._on_accruals_file_loaded(df, path))
+        worker.error.connect(self._on_accruals_file_error)
+        self._start_worker(worker)
+
+    def _on_accruals_file_loaded(self, df, path):
+        """Файл начислений загружен → теперь строим кеш в отдельном потоке."""
+        self._cleanup_worker()
+        try:
+            self._df_accruals = df
+            fname = os.path.basename(path)
+            self._log(f'  Файл прочитан: {len(df)} строк')
+
+            # Заполнить колонки начислений
+            self.cmb_accrual_msisdn.clear()
+            self.cmb_accrual_value.clear()
+            acc_cols = list(df.columns)
+            self.cmb_accrual_msisdn.addItems([str(c) for c in acc_cols])
+            self.cmb_accrual_value.addItems([str(c) for c in acc_cols])
+
+            # Автовыбор MSISDN
+            msisdn_col = find_column_contains_ci(acc_cols, ['msisdn', 'мсисден', 'номер'])
+            if msisdn_col:
+                idx = self.cmb_accrual_msisdn.findText(str(msisdn_col))
+                if idx >= 0:
+                    self.cmb_accrual_msisdn.setCurrentIndex(idx)
+
+            # Автовыбор колонки начислений
+            month = self.cmb_month.currentText()
+            accrual_col = find_column_contains_ci(acc_cols, ['факт', month.lower()])
+            if accrual_col is None:
+                accrual_col = find_column_contains_ci(acc_cols, ['начисл', month.lower()])
+            if accrual_col is None:
+                accrual_col = find_column_contains_ci(acc_cols, ['начисл'])
+            if accrual_col is None:
+                for c in reversed(acc_cols):
+                    if df[c].dtype in ['float64', 'int64', 'float32']:
+                        accrual_col = c
+                        break
+            if accrual_col:
+                idx = self.cmb_accrual_value.findText(str(accrual_col))
+                if idx >= 0:
+                    self.cmb_accrual_value.setCurrentIndex(idx)
+
+            msisdn_col_name = self.cmb_accrual_msisdn.currentText()
+            value_col_name = self.cmb_accrual_value.currentText()
+
+            if (not msisdn_col_name or msisdn_col_name == '— не выбрано —' or
+                    not value_col_name or value_col_name == '— не выбрано —'):
+                self._log('⚠ Выберите колонки MSISDN и начислений для файла начислений!')
+                self._set_busy(False)
+                return
+
+            # Теперь запускаем построение кеша в отдельном потоке
+            self.lbl_cache_status.setText('Кеш: построение словаря...')
+            self._update_progress('Построение кеша начислений...')
+
+            cache_worker = AccrualsCacheWorker(df, msisdn_col_name, value_col_name)
+            cache_worker.progress.connect(lambda msg: self._update_progress(msg))
+            cache_worker.finished.connect(
+                lambda cache, cnt: self._on_cache_built(cache, cnt, fname))
+            cache_worker.error.connect(self._on_cache_error)
+            self._start_worker(cache_worker)
+
+        except Exception as e:
+            self._set_busy(False)
+            self._log(f'✗ Ошибка загрузки начислений: {e}')
+            traceback.print_exc()
+            QMessageBox.critical(self, 'Ошибка', f'Не удалось загрузить начисления:\n{e}')
+
+    def _on_accruals_file_error(self, error_msg):
+        self._cleanup_worker()
+        self._set_busy(False)
+        self._log(f'✗ Ошибка загрузки начислений: {error_msg}')
+        QMessageBox.critical(self, 'Ошибка', f'Не удалось загрузить начисления:\n{error_msg}')
+
+    def _on_cache_built(self, cache, count, fname):
+        """Кеш построен → обновляем UI."""
+        self._cleanup_worker()
+        try:
+            self.accruals_cache = cache
+            self.accruals_file_name = fname
+            self.lbl_cache_status.setText(
+                f'✓ Кеш: {fname} ({count} записей)')
+            self.lbl_cache_status.setStyleSheet('color: green; font-weight: bold;')
+            self._log(f'✓ Кеш начислений сформирован: {count} абонентов')
+            self._check_ready_to_calculate()
+        except Exception as e:
+            self._log(f'✗ Ошибка: {e}')
+        finally:
+            self._set_busy(False)
+
+    def _on_cache_error(self, error_msg):
+        self._cleanup_worker()
+        self._set_busy(False)
+        self._log(f'✗ Ошибка построения кеша: {error_msg}')
+
+    def _rebuild_cache_from_ui(self):
+        if self._df_accruals is None:
+            self._log('⚠ Нет загруженных начислений для пересборки кеша.')
+            return
+        msisdn_col = self.cmb_accrual_msisdn.currentText()
+        value_col = self.cmb_accrual_value.currentText()
+        if (not msisdn_col or msisdn_col == '— не выбрано —' or
+                not value_col or value_col == '— не выбрано —'):
+            self._log('⚠ Выберите колонки MSISDN и начислений.')
+            return
+
+        self._log('Пересборка кеша...')
+        self._set_busy(True, 'Пересборка кеша...')
+
+        cache_worker = AccrualsCacheWorker(self._df_accruals, msisdn_col, value_col)
+        cache_worker.progress.connect(lambda msg: self._update_progress(msg))
+        cache_worker.finished.connect(
+            lambda cache, cnt: self._on_rebuild_done(cache, cnt))
+        cache_worker.error.connect(self._on_cache_error)
+        self._start_worker(cache_worker)
+
+    def _on_rebuild_done(self, cache, count):
+        self._cleanup_worker()
+        self.accruals_cache = cache
+        self.lbl_cache_status.setText(
+            f'✓ Кеш: {self.accruals_file_name} ({count} записей)')
+        self.lbl_cache_status.setStyleSheet('color: green; font-weight: bold;')
+        self._log(f'✓ Кеш пересобран: {count} абонентов')
+        self._check_ready_to_calculate()
+        self._set_busy(False)
+
+    def _clear_cache(self):
+        self.accruals_cache = {}
+        self.accruals_file_name = ''
+        self._df_accruals = None
+        self.lbl_cache_status.setText('Кеш: пуст')
+        self.lbl_cache_status.setStyleSheet('color: gray;')
+        self._log('Кеш начислений очищен.')
+        self._check_ready_to_calculate()
+
+    def _check_ready_to_calculate(self):
+        if self._busy:
+            return
+        ready = True
+        reasons = []
+        if self.df_base is None or len(self.df_base) == 0:
+            ready = False
+            reasons.append('не загружена база индексации')
+        if self.mode == 'A' and len(self.accruals_cache) == 0:
+            ready = False
+            reasons.append('не загружены начисления (режим А)')
+        if not self._get_selected_col('msisdn'):
+            ready = False
+            reasons.append('не выбрана колонка MSISDN')
+        if not self._get_selected_col('ap_before'):
+            ready = False
+            reasons.append('не выбрана колонка АП до')
+        self.btn_calculate.setEnabled(ready)
+        if ready:
+            self._log('✓ Готово к расчёту!')
+        elif reasons:
+            self._log(f'  Не готово к расчёту: {"; ".join(reasons)}')
+
+    def _get_filter_values(self, chk_dict):
+        checked = [k for k, cb in chk_dict.items() if cb.isChecked()]
+        if len(checked) == 0 or len(checked) == len(chk_dict):
+            return None
+        return set(checked)
+
+    # ─── Расчёт (async) ───
+
+    def _calculate(self):
+        if self.report_handler is None:
+            QMessageBox.warning(self, 'Внимание', 'Загрузите файл отчёта.')
+            return
+
+        self._log('')
+        self._log('=' * 50)
+        self._log(f'▶ Расчёт фактического эффекта для МРФ: {self.current_mrf_full}')
+        t0 = time.time()
+
+        # Собрать маппинг колонок
+        col_mapping = {}
+        for role, cmb in self.cmb_mapping.items():
+            col_mapping[role] = cmb.currentText() if cmb.currentIndex() > 0 else ''
+
+        if self.mode == 'B':
+            if self.cmb_accrual_col_b.currentIndex() > 0:
+                col_mapping['accrual_report'] = self.cmb_accrual_col_b.currentText()
+            else:
+                self._log('✗ Не выбрана колонка начислений за отчётный месяц (режим Б)')
+                return
+
+        if not col_mapping.get('msisdn'):
+            self._log('✗ Не выбрана колонка MSISDN в базе индексации')
+            return
+        if not col_mapping.get('ap_before'):
+            self._log('✗ Не выбрана колонка АП до в базе индексации')
+            return
+
+        filter_dates = self._get_filter_values(self.chk_dates)
+        filter_services = self._get_filter_values(self.chk_services)
+        filter_segments = self._get_filter_values(self.chk_segments)
+        filter_subsegments = self._get_filter_values(self.chk_subsegments)
+
+        df_filtered = self._filter_base_by_mrf(self.df_base, col_mapping)
+        self._log(f'  Строк в базе после фильтрации по МРФ: '
+                  f'{len(df_filtered)} из {len(self.df_base)}')
+
+        self._set_busy(True, 'Расчёт фактического эффекта...')
+
+        calc_worker = CalculationWorker(
+            df_base=df_filtered,
+            col_mapping=col_mapping,
+            accruals_dict=self.accruals_cache if self.mode == 'A' else {},
+            mode=self.mode,
+            filter_dates=filter_dates,
+            filter_services=filter_services,
+            filter_segments=filter_segments,
+            filter_subsegments=filter_subsegments,
+        )
+        calc_worker.progress.connect(lambda msg: self._update_progress(msg))
+        calc_worker.finished.connect(
+            lambda results, stats: self._on_calc_done(results, stats, t0))
+        calc_worker.error.connect(self._on_calc_error)
+        self._start_worker(calc_worker)
+
+    def _on_calc_done(self, results, stats, t0):
+        self._cleanup_worker()
+        try:
+            self._log(f'  Обработано строк: {stats["processed"]} из {stats["total_rows"]}')
+            self._log(f'  Не найдено начислений: {stats["no_accrual"]}')
+            self._log(f'  Нулевой эффект: {stats["zero_effect"]}')
+            self._log(f'  Уникальных комбинаций: {len(results)}')
+
+            if len(results) == 0:
+                self._log('⚠ Нет данных для записи. Проверьте фильтры и маппинг колонок.')
+                self._set_busy(False)
+                return
+
+            # Запись в отчёт (в основном потоке — openpyxl не потокобезопасен)
+            self._update_progress('Запись результатов в отчёт...')
+            month_name = self.cmb_month.currentText()
+            write_stats = self.report_handler.write_results(
+                results, month_name, log_callback=self._log)
+
+            elapsed = time.time() - t0
+            self._log(f'')
+            self._log(f'✓ Расчёт завершён за {elapsed:.1f} сек.')
+            self._log(f'  Обновлено строк: {write_stats["updated_rows"]}')
+            self._log(f'  Добавлено строк: {write_stats["added_rows"]}')
+            self._log(f'  Зелёных (эффект > 0): {write_stats["written"]}')
+            self._log(f'  Жёлтых (нет данных): {write_stats["yellow_cells"]}')
+
+            total_effect = sum(results.values()) / 1000.0
+            self._log(f'  ИТОГО эффект: {total_effect:.2f} тыс.руб. без НДС')
+
+            self.btn_next_mrf.setEnabled(True)
+            self.btn_save_report.setEnabled(True)
+        except Exception as e:
+            self._log(f'✗ Ошибка записи в отчёт: {e}')
+            traceback.print_exc()
+        finally:
+            self._set_busy(False)
+
+    def _on_calc_error(self, error_msg):
+        self._cleanup_worker()
+        self._set_busy(False)
+        self._log(f'✗ Ошибка расчёта: {error_msg}')
+        QMessageBox.critical(self, 'Ошибка расчёта', error_msg)
+
+    def _filter_base_by_mrf(self, df, col_mapping):
+        col_mrf = col_mapping.get('mrf', '')
+        col_rf = col_mapping.get('rf', '')
+        mrf_full = self.current_mrf_full
+        mrf_short = MRF_FULL_TO_SHORT.get(mrf_full, mrf_full)
+        rf_list = MRF_TO_RF.get(mrf_full, [])
+
+        mask = pd.Series(False, index=df.index)
+
+        if col_mrf and col_mrf in df.columns:
+            mrf_vals = df[col_mrf].astype(str).str.strip().str.lower()
+            mask = mask | (mrf_vals == mrf_full.lower()) | (mrf_vals == mrf_short.lower())
+
+        if col_rf and col_rf in df.columns:
+            rf_vals = df[col_rf].astype(str).str.strip().str.lower()
+            rf_lower_set = set(r.lower() for r in rf_list)
+            mask = mask | rf_vals.isin(rf_lower_set)
+
+        if not mask.any():
+            self._log(f'  ⚠ Прямое совпадение МРФ не найдено. Используем все строки базы.')
+            return df
+        return df[mask].copy()
+
+    def _next_mrf(self):
+        self._clear_cache()
+        self.current_mrf_idx += 1
+        self._activate_current_mrf()
+
+    def _save_report(self):
+        if self.report_handler is None:
+            return
+        try:
+            self._set_busy(True, 'Сохранение отчёта...')
+            self.report_handler.save()
+            self._log(f'✓ Отчёт сохранён: {self.report_path}')
+            self._set_busy(False)
+            QMessageBox.information(self, 'Сохранено',
+                                    f'Отчёт сохранён:\n{self.report_path}')
+        except Exception as e:
+            self._set_busy(False)
+            self._log(f'✗ Ошибка сохранения: {e}')
+            QMessageBox.critical(self, 'Ошибка', f'Не удалось сохранить:\n{e}')
+
+    def _update_progress(self, message):
+        """Обновить текст прогресс-бара и журнал."""
+        self.progress_bar.setFormat(message)
+        QApplication.processEvents()
+
+    def _log(self, message):
+        ts = timestamp_str()
+        line = f'[{ts}] {message}'
+        self.txt_log.append(line)
+        if self.log_file:
+            try:
+                self.log_file.write(line + '\n')
+                self.log_file.flush()
+            except:
+                pass
+        sb = self.txt_log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def closeEvent(self, event):
+        self._cleanup_worker()
+        if self.report_handler:
+            self.report_handler.close()
+        if self.log_file:
+            self.log_file.close()
+        event.accept()
+
+
+# ─────────────────────────────────────────────
+#  7. ТОЧКА ВХОДА
+# ─────────────────────────────────────────────
+
+def main():
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == '__main__':
+    main()
