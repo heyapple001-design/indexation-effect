@@ -1,0 +1,18 @@
+class FileLoadThread(QThread):
+    """Поток для загрузки Excel файлов"""
+    progress_updated = pyqtSignal(str)
+    file_loaded = pyqtSignal(pd.DataFrame, str)  # (dataframe, filename)
+    error_occurred = pyqtSignal(str)
+    
+    def __init__(self, filepath):
+        super().__init__()
+        self.filepath = filepath
+        
+    def run(self):
+        try:
+            self.progress_updated.emit(f"⏳ Загрузка {os.path.basename(self.filepath)}...")
+            # Загружаем только нужные колонки для ускорения
+            df = pd.read_excel(self.filepath, sheet_name='Лист1', engine='openpyxl')
+            self.file_loaded.emit(df, os.path.basename(self.filepath))
+        except Exception as e:
+            self.error_occurred.emit(str(e))
