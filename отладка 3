@@ -1,0 +1,311 @@
+def process_one_base(df_base: pd.DataFrame,
+                     df_amount: Optional[pd.DataFrame],
+                     df_report,
+                     base_col,
+                     id_col,
+                     amount_col,
+                     current_col,
+                     charges_mode,
+                     available_group_cols,
+                     target_col,
+                     base_name, mrf_name, iteration_num):
+
+    print(f"\n  {'='*55}")
+    print(f"  БАЗА #{iteration_num} [{mrf_name}]: {base_name}")
+    mode_label = "📂 отдельный файл начислений" if charges_mode == MODE_EXTERNAL else "📊 начисления в базе"
+    print(f"  Режим: {mode_label}")
+    print(f"  {'='*55}")
+
+    _wait_calc = WaitingWindow("⏳ Идёт расчёт...",
+                               "Вычисляется эффект индексации.\nПожалуйста, подождите.")
+    t_calc = datetime.now()
+    try:
+        if charges_mode == MODE_EXTERNAL:
+            pivot = calc_pivot_external(df_base, df_amount, base_col,
+                                        id_col, amount_col, available_group_cols)
+            # ---- СОЗДАЁМ debug_merged ДЛЯ ВСЕХ РЕЖИМОВ ----
+            df_base_debug = df_base.copy()
+            df_amount_debug = df_amount.copy()
+            df_base_debug[base_col] = pd.to_numeric(df_base_debug[base_col], errors='coerce')
+            df_amount_debug[amount_col] = pd.to_numeric(df_amount_debug[amount_col], errors='coerce')
+            df_base_debug[id_col] = df_base_debug[id_col].astype(str).str.strip().str.replace('.0', '', regex=False)
+            df_amount_debug["MSISDN"] = df_amount_debug["MSISDN"].astype(str).str.strip().str.replace('.0', '', regex=False)
+            
+            # ---- ПРОВЕРКА СОЕДИНЕНИЯ ----
+            print(f"\n🔍 ПРОВЕРКА СОЕДИНЕНИЯ ПО MSISDN:")
+            print(f"   Уникальных MSISDN в базе: {df_base_debug[id_col].nunique()}")
+            print(f"   Уникальных MSISDN в начислениях: {df_amount_debug['MSISDN'].nunique()}")
+            
+            # Проверяем пересечение
+            base_msisdn = set(df_base_debug[id_col].dropna())
+            amount_msisdn = set(df_amount_debug['MSISDN'].dropna())
+            intersection = base_msisdn & amount_msisdn
+            only_in_base = base_msisdn - amount_msisdn
+            only_in_amount = amount_msisdn - base_msisdn
+            
+            print(f"   Пересечение: {len(intersection)} MSISDN")
+            print(f"   Только в базе: {len(only_in_base)} MSISDN")
+            if len(only_in_base) > 0:
+                print(f"   ⚠️  Примеры MSISDN только в базе (первые 5): {list(only_in_base)[:5]}")
+            print(f"   Только в начислениях: {len(only_in_amount)} MSISDN")
+            if len(only_in_amount) > 0:
+                print(f"   ⚠️  Примеры MSISDN только в начислениях (первые 5): {list(only_in_amount)[:5]}")
+            
+            debug_merged = df_base_debug.merge(
+                df_amount_debug[["MSISDN", amount_col]],
+                left_on=id_col, right_on="MSISDN", how='left'
+            )
+            
+            # Проверяем, сколько MSISDN получили начисления
+            has_amount = debug_merged[amount_col].notna().sum()
+            print(f"   MSISDN с начислениями после merge: {has_amount} из {len(debug_merged)}")
+            
+            debug_merged['Эффект_руб'] = debug_merged[amount_col] - debug_merged[base_col]
+            debug_merged.loc[debug_merged['Эффект_руб'] < 0, 'Эффект_руб'] = 0
+            
+            # ---- ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА ДАННЫХ ----
+            print(f"\n📊 СТАТИСТИКА ПО ДАННЫМ:")
+            print(f"   Среднее 'До индексации': {debug_merged[base_col].mean():.2f}")
+            print(f"   Среднее 'Текущее': {debug_merged[amount_col].mean():.2f}")
+            print(f"   Всего строк с эффектом > 0: {(debug_merged['Эффект_руб'] > 0).sum()}")
+            
+        else:
+            pivot = calc_pivot_inbase(df_base, base_col, current_col, available_group_cols)
+            debug_merged = df_base.copy()
+            debug_merged['Эффект_руб'] = debug_merged[current_col] - debug_merged[base_col]
+            debug_merged.loc[debug_merged['Эффект_руб'] < 0, 'Эффект_руб'] = 0
+            
+    finally:
+        _wait_calc.close()
+    calc_sec = (datetime.now() - t_calc).total_seconds()
+    print(f"   Групп: {len(pivot)}, эффект: {pivot['Эффект_тыс'].sum():,.3f} тыс. руб. "
+          f"(расчёт: {calc_sec:.1f} сек)")
+
+    if len(pivot) == 0:
+        print("   ❌ Пустой pivot — нет данных.")
+        return None
+
+    sel = filter_window(df_report, mrf_name=mrf_name)
+    if not sel or not sel.get("date") or sel.get("selected") is None:
+        print("  Фильтры не выбраны — база пропущена.")
+        return None
+
+    selected_date     = sel["date"]
+    selected_segments = sel.get("selected") or {}
+
+    svc_col_report = RPT_COL_SERVICE if RPT_COL_SERVICE in df_report.columns else None
+    if svc_col_report is None:
+        print(f"   ⚠️  В отчёте нет колонки '{RPT_COL_SERVICE}' — фильтр по услуге не применяется")
+    selected_services = set()
+    for fc, fv in selected_segments.items():
+        if fc == "Услуга":
+            selected_services = set(fv); break
+
+    # ══════════════════════════════════════════════════════════════
+    #  🐞 СУПЕР-ДЕТАЛЬНАЯ ОТЛАДКА ПО КАЖДОМУ MSISDN
+    # ══════════════════════════════════════════════════════════════
+    
+    print("\n" + "="*80)
+    print("🔍 ДЕТАЛЬНАЯ ОТЛАДКА ПО КАЖДОМУ MSISDN")
+    print("="*80)
+    
+    # ---- ПРОВЕРЯЕМ КОЛОНКИ ----
+    print("\n--- ПРОВЕРКА КОЛОНОК В PIVOT ---")
+    print(f"   Колонки в pivot: {list(pivot.columns)}")
+    print(f"   BASE_COL_SERVICE = '{BASE_COL_SERVICE}' -> {BASE_COL_SERVICE in pivot.columns}")
+    print(f"   BASE_COL_MRF = '{BASE_COL_MRF}' -> {BASE_COL_MRF in pivot.columns}")
+    print(f"   BASE_COL_RF = '{BASE_COL_RF}' -> {BASE_COL_RF in pivot.columns}")
+    print(f"   BASE_COL_SEGMENT = '{BASE_COL_SEGMENT}' -> {BASE_COL_SEGMENT in pivot.columns}")
+    print(f"   BASE_COL_SUBSEG = '{BASE_COL_SUBSEG}' -> {BASE_COL_SUBSEG in pivot.columns}")
+
+    # ---- ФИЛЬТРУЕМ ДАННЫЕ ПО УСЛОВИЯМ ----
+    # 1. Находим все строки, которые должны попасть в итоговую сумму 653,833
+    print("\n--- ФИЛЬТРАЦИЯ ДАННЫХ ПО УСЛОВИЯМ ---")
+    
+    # Строим маску для фильтрации всех нужных строк
+    mask = pd.Series([True] * len(debug_merged))
+    
+    # Фильтр по РФ (Челябинский)
+    if BASE_COL_RF in debug_merged.columns:
+        mask &= (debug_merged[BASE_COL_RF].apply(
+            lambda x: "челябинск" in str(x).lower() if pd.notna(x) else False
+        ))
+        print(f"   После фильтра по РФ (Челябинск): {mask.sum()} строк")
+    
+    # Фильтр по подсегменту (ТОП)
+    if BASE_COL_SUBSEG in debug_merged.columns:
+        mask &= (debug_merged[BASE_COL_SUBSEG].apply(
+            lambda x: "топ" in str(x).lower() if pd.notna(x) else False
+        ))
+        print(f"   После фильтра по Подсегменту (ТОП): {mask.sum()} строк")
+    
+    # Фильтр по услуге (ШПД)
+    if BASE_COL_SERVICE in debug_merged.columns:
+        mask &= (debug_merged[BASE_COL_SERVICE].apply(
+            lambda x: "шпд" in str(x).lower() if pd.notna(x) else False
+        ))
+        print(f"   После фильтра по Услуге (ШПД): {mask.sum()} строк")
+    
+    # Фильтр по сегменту (B2B 3К)
+    if BASE_COL_SEGMENT in debug_merged.columns:
+        mask &= (debug_merged[BASE_COL_SEGMENT].apply(
+            lambda x: "b2b 3к" in str(x).lower() if pd.notna(x) else False
+        ))
+        print(f"   После фильтра по Сегменту (B2B 3К): {mask.sum()} строк")
+    
+    # Применяем фильтр
+    filtered_data = debug_merged[mask].copy()
+    
+    print(f"\n📊 ИТОГО НАЙДЕНО СТРОК: {len(filtered_data)}")
+    if len(filtered_data) > 0:
+        total_effect = filtered_data['Эффект_руб'].sum()
+        print(f"   Сумма эффекта (руб): {total_effect:.2f}")
+        print(f"   Сумма эффекта (тыс): {total_effect/1000:.3f}")
+        print(f"   Ожидалось (тыс): 653.833")
+        print(f"   Разница (тыс): {total_effect/1000 - 653.833:.3f}")
+    
+    # ---- ДЕТАЛЬНЫЙ РАЗБОР КАЖДОГО MSISDN ----
+    print("\n" + "="*80)
+    print("📋 ДЕТАЛЬНЫЙ РАЗБОР ПО КАЖДОМУ MSISDN")
+    print("="*80)
+    
+    if len(filtered_data) > 0:
+        # Сортируем по эффекту для удобства
+        filtered_data_sorted = filtered_data.sort_values('Эффект_руб', ascending=False)
+        
+        # Определяем колонки для вывода
+        id_col_display = id_col if id_col in filtered_data_sorted.columns else "MSISDN"
+        base_col_display = base_col if base_col in filtered_data_sorted.columns else None
+        amount_col_display = amount_col if amount_col in filtered_data_sorted.columns else current_col
+        
+        # Заголовок таблицы
+        print(f"\n{'№':<4} {'MSISDN':<15} {'До индексации':<15} {'Текущее':<15} {'Эффект (руб)':<15} {'Эффект (тыс)':<12}")
+        print("-" * 80)
+        
+        total_rub = 0
+        total_thousands = 0
+        
+        for i, (idx, row) in enumerate(filtered_data_sorted.iterrows(), 1):
+            msisdn = row[id_col_display] if id_col_display in row.index else "N/A"
+            base_val = row[base_col_display] if base_col_display else 0
+            curr_val = row[amount_col_display] if amount_col_display else 0
+            eff_rub = row['Эффект_руб'] if 'Эффект_руб' in row.index else 0
+            eff_thousands = eff_rub / 1000
+            
+            total_rub += eff_rub
+            total_thousands += eff_thousands
+            
+            # Выделяем проблемные строки (где эффект = 0 или отрицательный)
+            marker = ""
+            if eff_rub == 0:
+                marker = " ⚠️ НУЛЕВОЙ"
+            elif eff_rub < 0:
+                marker = " ⚠️ ОТРИЦАТЕЛЬНЫЙ"
+            
+            print(f"{i:<4} {str(msisdn):<15} {base_val:<15.2f} {curr_val:<15.2f} {eff_rub:<15.2f} {eff_thousands:<12.3f}{marker}")
+        
+        print("-" * 80)
+        print(f"{'ИТОГО:':<4} {'':<15} {'':<15} {'':<15} {total_rub:<15.2f} {total_thousands:<12.3f}")
+        
+        # ---- АНАЛИЗ ПРОБЛЕМНЫХ MSISDN ----
+        print("\n" + "="*80)
+        print("🔍 АНАЛИЗ ПРОБЛЕМНЫХ MSISDN")
+        print("="*80)
+        
+        # MSISDN с нулевым эффектом
+        zero_effect = filtered_data[filtered_data['Эффект_руб'] == 0]
+        if len(zero_effect) > 0:
+            print(f"\n⚠️  MSISDN с НУЛЕВЫМ эффектом: {len(zero_effect)} шт.")
+            print("   (эти строки не дают вклада в итоговую сумму)")
+            for i, (idx, row) in enumerate(zero_effect.iterrows(), 1):
+                msisdn = row[id_col_display] if id_col_display in row.index else "N/A"
+                base_val = row[base_col_display] if base_col_display else 0
+                curr_val = row[amount_col_display] if amount_col_display else 0
+                print(f"   [{i}] MSISDN: {msisdn}, До: {base_val:.2f}, Текущее: {curr_val:.2f}")
+        
+        # MSISDN с отрицательным эффектом (обнулены)
+        negative_effect = filtered_data[filtered_data['Эффект_руб'] < 0]
+        if len(negative_effect) > 0:
+            print(f"\n⚠️  MSISDN с ОТРИЦАТЕЛЬНЫМ эффектом (обнулены): {len(negative_effect)} шт.")
+            print("   (эти строки обнулены кодом, но должны были уменьшить сумму)")
+            for i, (idx, row) in enumerate(negative_effect.iterrows(), 1):
+                msisdn = row[id_col_display] if id_col_display in row.index else "N/A"
+                base_val = row[base_col_display] if base_col_display else 0
+                curr_val = row[amount_col_display] if amount_col_display else 0
+                eff_rub = row['Эффект_руб'] if 'Эффект_руб' in row.index else 0
+                print(f"   [{i}] MSISDN: {msisdn}, До: {base_val:.2f}, Текущее: {curr_val:.2f}, Эффект: {eff_rub:.2f}")
+        
+        # MSISDN с очень маленьким эффектом (могут быть округлены)
+        small_effect = filtered_data[(filtered_data['Эффект_руб'] > 0) & (filtered_data['Эффект_руб'] < 1)]
+        if len(small_effect) > 0:
+            print(f"\nℹ️  MSISDN с МАЛЕНЬКИМ эффектом (< 1 руб): {len(small_effect)} шт.")
+            for i, (idx, row) in enumerate(small_effect.iterrows(), 1):
+                msisdn = row[id_col_display] if id_col_display in row.index else "N/A"
+                eff_rub = row['Эффект_руб'] if 'Эффект_руб' in row.index else 0
+                print(f"   [{i}] MSISDN: {msisdn}, Эффект: {eff_rub:.2f} руб")
+        
+        # ---- ПРОВЕРКА ГРУППИРОВКИ ----
+        print("\n" + "="*80)
+        print("📊 ПРОВЕРКА ГРУППИРОВКИ")
+        print("="*80)
+        
+        # Проверяем, как группируются данные
+        if all(col in filtered_data.columns for col in [BASE_COL_SERVICE, BASE_COL_MRF, BASE_COL_RF, BASE_COL_SEGMENT, BASE_COL_SUBSEG]):
+            group_cols = [BASE_COL_SERVICE, BASE_COL_MRF, BASE_COL_RF, BASE_COL_SEGMENT, BASE_COL_SUBSEG]
+            grouped = filtered_data.groupby(group_cols)['Эффект_руб'].sum().reset_index()
+            
+            print(f"\n   Группировка данных по услуге/МРФ/РФ/сегменту/подсегменту:")
+            print(f"   Всего групп: {len(grouped)}")
+            
+            for i, (_, row) in enumerate(grouped.iterrows(), 1):
+                svc = row[BASE_COL_SERVICE]
+                rf = row[BASE_COL_RF]
+                seg = row[BASE_COL_SEGMENT]
+                sub = row[BASE_COL_SUBSEG]
+                eff = row['Эффект_руб']
+                print(f"   [{i}] Услуга='{svc}', РФ='{rf}', Сег='{seg}', Под='{sub}', Эффект={eff/1000:.3f} тыс.")
+            
+            # Сравниваем с pivot
+            print(f"\n   Сумма по filtered_data: {filtered_data['Эффект_руб'].sum()/1000:.3f} тыс.")
+            print(f"   Сумма по grouped: {grouped['Эффект_руб'].sum()/1000:.3f} тыс.")
+            
+            if abs(filtered_data['Эффект_руб'].sum() - grouped['Эффект_руб'].sum()) > 0.01:
+                print("   ⚠️  РАСХОЖДЕНИЕ между filtered_data и grouped!")
+        
+    else:
+        print("   ❌ Нет данных для отладки!")
+        print("   Проверьте:")
+        print("   - Правильно ли определены колонки?")
+        print("   - Есть ли данные по Челябинскому филиалу?")
+        print("   - Есть ли подсегмент 'ТОП' в данных?")
+        
+        # Показываем, что есть в данных
+        if BASE_COL_RF in debug_merged.columns:
+            print(f"\n   Уникальные РФ в данных: {debug_merged[BASE_COL_RF].unique()[:10]}")
+        if BASE_COL_SUBSEG in debug_merged.columns:
+            print(f"   Уникальные подсегменты: {debug_merged[BASE_COL_SUBSEG].unique()[:10]}")
+        if BASE_COL_SERVICE in debug_merged.columns:
+            print(f"   Уникальные услуги: {debug_merged[BASE_COL_SERVICE].unique()[:10]}")
+
+    # ---- ПРОДОЛЖЕНИЕ ОСНОВНОЙ ЛОГИКИ ----
+    print("\n" + "="*80)
+    print("📊 ИТОГОВАЯ СУММА ДЛЯ ЗАПИСИ В ОТЧЁТ")
+    print("="*80)
+    
+    # Используем filtered_data для расчёта итоговой суммы
+    if len(filtered_data) > 0:
+        final_effect_rub = filtered_data['Эффект_руб'].sum()
+        final_effect_thousands = final_effect_rub / 1000
+        print(f"   Итоговая сумма (руб): {final_effect_rub:.2f}")
+        print(f"   Итоговая сумма (тыс): {final_effect_thousands:.3f}")
+        print(f"   Ожидалось (тыс): 653.833")
+        print(f"   Разница (тыс): {final_effect_thousands - 653.833:.3f}")
+    else:
+        final_effect_thousands = 0
+        print("   ⚠️  Нет данных — итоговая сумма = 0")
+    
+    print("="*80 + "\n")
+
+    # ... (остальной код записи в Excel)
+    
+    return final_effect_thousands
