@@ -23,8 +23,25 @@ def process_one_base(df_base: pd.DataFrame,
         if charges_mode == MODE_EXTERNAL:
             pivot = calc_pivot_external(df_base, df_amount, base_col,
                                         id_col, amount_col, available_group_cols)
+            # Сохраняем исходные данные для отладки
+            debug_merged = None
+            if charges_mode == MODE_EXTERNAL:
+                # Повторяем merge для отладки
+                df_base_debug = df_base.copy()
+                df_amount_debug = df_amount.copy()
+                df_base_debug[base_col] = pd.to_numeric(df_base_debug[base_col], errors='coerce')
+                df_amount_debug[amount_col] = pd.to_numeric(df_amount_debug[amount_col], errors='coerce')
+                df_base_debug[id_col] = df_base_debug[id_col].astype(str).str.strip().str.replace('.0', '', regex=False)
+                df_amount_debug["MSISDN"] = df_amount_debug["MSISDN"].astype(str).str.strip().str.replace('.0', '', regex=False)
+                debug_merged = df_base_debug.merge(
+                    df_amount_debug[["MSISDN", amount_col]],
+                    left_on=id_col, right_on="MSISDN", how='left'
+                )
+                debug_merged['Эффект_руб'] = debug_merged[amount_col] - debug_merged[base_col]
+                debug_merged.loc[debug_merged['Эффект_руб'] < 0, 'Эффект_руб'] = 0
         else:
             pivot = calc_pivot_inbase(df_base, base_col, current_col, available_group_cols)
+            debug_merged = None
     finally:
         _wait_calc.close()
     calc_sec = (datetime.now() - t_calc).total_seconds()
@@ -52,7 +69,7 @@ def process_one_base(df_base: pd.DataFrame,
             selected_services = set(fv); break
 
     # ══════════════════════════════════════════════════════════════
-    #  🐞 СУПЕР-ДЕТАЛЬНАЯ ОТЛАДКА для ЧЕЛЯБИНСКОГО ФИЛИАЛА / ТОП
+    #  🐞 СУПЕР-ДЕТАЛЬНАЯ ОТЛАДКА с MSISDN для ЧЕЛЯБИНСКОГО ФИЛИАЛА / ТОП
     # ══════════════════════════════════════════════════════════════
     chelyabinsk_rf_norm = norm_text(unmap_rf("Челябинский"))
     print("\n" + "="*80)
@@ -106,6 +123,60 @@ def process_one_base(df_base: pd.DataFrame,
             eff = row['Эффект_тыс']
             total += eff
             print(f"   [{idx}] Услуга='{svc}', Сег='{seg}', Под='{sub}', Эффект={eff:.3f} (накоплено: {total:.3f})")
+
+    # ---- ШАГ 3.1: ДЕТАЛЬНЫЙ РАЗБОР КАЖДОЙ ГРУППЫ С MSISDN ----
+    if len(pivot_target) > 0 and debug_merged is not None:
+        print("\n--- ШАГ 3.1: ДЕТАЛЬНЫЙ РАЗБОР КАЖДОЙ ГРУППЫ (MSISDN и начисления) ---")
+        for idx, row in pivot_target.iterrows():
+            svc = row[BASE_COL_SERVICE] if BASE_COL_SERVICE in row.index else ""
+            mrf = row[BASE_COL_MRF] if BASE_COL_MRF in row.index else ""
+            rf = row[BASE_COL_RF] if BASE_COL_RF in row.index else ""
+            seg = row[BASE_COL_SEGMENT] if BASE_COL_SEGMENT in row.index else ""
+            sub = row[BASE_COL_SUBSEG] if BASE_COL_SUBSEG in row.index else ""
+            eff = row['Эффект_тыс']
+            
+            print(f"\n   📌 ГРУППА [{idx}]: Услуга='{svc}', МРФ='{mrf}', РФ='{rf}', Сег='{seg}', Под='{sub}'")
+            print(f"      Итоговый эффект: {eff:.3f} тыс. руб.")
+            
+            # Находим все MSISDN в этой группе из debug_merged
+            mask = (
+                (debug_merged[BASE_COL_SERVICE].apply(lambda x: norm_text(x) if pd.notna(x) else "") == norm_text(svc)) &
+                (debug_merged[BASE_COL_MRF].apply(lambda x: norm_text(x) if pd.notna(x) else "") == norm_text(mrf)) &
+                (debug_merged[BASE_COL_RF].apply(lambda x: map_rf(x) if pd.notna(x) else "") == map_rf(rf)) &
+                (debug_merged[BASE_COL_SEGMENT].apply(lambda x: norm_text(x) if pd.notna(x) else "") == norm_text(seg)) &
+                (debug_merged[BASE_COL_SUBSEG].apply(lambda x: norm_text(x) if pd.notna(x) else "") == norm_text(sub))
+            )
+            group_data = debug_merged[mask]
+            
+            print(f"      Количество MSISDN в группе: {len(group_data)}")
+            if len(group_data) > 0:
+                print(f"      Сумма 'До индексации': {group_data[base_col].sum():.2f} руб.")
+                print(f"      Сумма 'Текущее': {group_data[amount_col].sum():.2f} руб.")
+                print(f"      Сумма эффекта (руб): {group_data['Эффект_руб'].sum():.2f} руб.")
+                print(f"      Сумма эффекта (тыс): {group_data['Эффект_руб'].sum()/1000:.3f} тыс. руб.")
+                
+                # Показываем первые 10 MSISDN с деталями
+                print(f"\n      ПЕРВЫЕ 10 MSISDN (всего {len(group_data)}):")
+                for i, (_, g_row) in enumerate(group_data.head(10).iterrows()):
+                    msisdn = g_row[id_col] if id_col in g_row.index else "N/A"
+                    base_val = g_row[base_col] if base_col in g_row.index else 0
+                    curr_val = g_row[amount_col] if amount_col in g_row.index else 0
+                    eff_val = g_row['Эффект_руб'] if 'Эффект_руб' in g_row.index else 0
+                    print(f"      [{i+1}] MSISDN: {msisdn}, До: {base_val:.2f}, Текущее: {curr_val:.2f}, Эффект: {eff_val:.2f}")
+                
+                if len(group_data) > 10:
+                    print(f"      ... и ещё {len(group_data) - 10} MSISDN")
+                    
+                # Статистика по эффекту
+                positive = (group_data['Эффект_руб'] > 0).sum()
+                zero = (group_data['Эффект_руб'] == 0).sum()
+                negative = (group_data['Эффект_руб'] < 0).sum()
+                print(f"\n      Статистика по эффекту:")
+                print(f"      - Положительный: {positive} MSISDN")
+                print(f"      - Нулевой: {zero} MSISDN")
+                print(f"      - Отрицательный (обнулены): {negative} MSISDN")
+            else:
+                print(f"      ⚠️  Нет данных в debug_merged для этой группы!")
 
     # ---- ШАГ 4: Проверяем, не попали ли другие сегменты ----
     print("\n--- ШАГ 4: ДРУГИЕ СЕГМЕНТЫ В ЧЕЛЯБИНСКОМ ФИЛИАЛЕ ---")
