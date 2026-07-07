@@ -1,0 +1,63 @@
+# ---- ШАГ 3.1: ДЕТАЛЬНЫЙ РАЗБОР КАЖДОЙ ГРУППЫ С MSISDN (ВСЕ) ----
+if len(pivot_target) > 0 and debug_merged is not None:
+    print("\n--- ШАГ 3.1: ДЕТАЛЬНЫЙ РАЗБОР КАЖДОЙ ГРУППЫ (ВСЕ MSISDN) ---")
+    for idx, row in pivot_target.iterrows():
+        svc = row[BASE_COL_SERVICE] if BASE_COL_SERVICE in row.index else ""
+        mrf = row[BASE_COL_MRF] if BASE_COL_MRF in row.index else ""
+        rf = row[BASE_COL_RF] if BASE_COL_RF in row.index else ""
+        seg = row[BASE_COL_SEGMENT] if BASE_COL_SEGMENT in row.index else ""
+        sub = row[BASE_COL_SUBSEG] if BASE_COL_SUBSEG in row.index else ""
+        eff = row['Эффект_тыс']
+        
+        print(f"\n   📌 ГРУППА [{idx}]: Услуга='{svc}', МРФ='{mrf}', РФ='{rf}', Сег='{seg}', Под='{sub}'")
+        print(f"      Итоговый эффект: {eff:.3f} тыс. руб.")
+        
+        # Находим все MSISDN в этой группе из debug_merged
+        mask = (
+            (debug_merged[BASE_COL_SERVICE].apply(lambda x: norm_text(x) if pd.notna(x) else "") == norm_text(svc)) &
+            (debug_merged[BASE_COL_MRF].apply(lambda x: norm_text(x) if pd.notna(x) else "") == norm_text(mrf)) &
+            (debug_merged[BASE_COL_RF].apply(lambda x: map_rf(x) if pd.notna(x) else "") == map_rf(rf)) &
+            (debug_merged[BASE_COL_SEGMENT].apply(lambda x: norm_text(x) if pd.notna(x) else "") == norm_text(seg)) &
+            (debug_merged[BASE_COL_SUBSEG].apply(lambda x: norm_text(x) if pd.notna(x) else "") == norm_text(sub))
+        )
+        group_data = debug_merged[mask]
+        
+        print(f"      Количество MSISDN в группе: {len(group_data)}")
+        if len(group_data) > 0:
+            print(f"      Сумма 'До индексации': {group_data[base_col].sum():.2f} руб.")
+            print(f"      Сумма 'Текущее': {group_data[amount_col].sum():.2f} руб.")
+            print(f"      Сумма эффекта (руб): {group_data['Эффект_руб'].sum():.2f} руб.")
+            print(f"      Сумма эффекта (тыс): {group_data['Эффект_руб'].sum()/1000:.3f} тыс. руб.")
+            
+            # Показываем ВСЕ MSISDN с деталями
+            print(f"\n      ВСЕ MSISDN (всего {len(group_data)}):")
+            print(f"      {'№':<4} {'MSISDN':<15} {'До индексации':<15} {'Текущее':<15} {'Эффект':<15}")
+            print(f"      {'-'*4} {'-'*15} {'-'*15} {'-'*15} {'-'*15}")
+            for i, (_, g_row) in enumerate(group_data.iterrows(), 1):
+                msisdn = g_row[id_col] if id_col in g_row.index else "N/A"
+                base_val = g_row[base_col] if base_col in g_row.index else 0
+                curr_val = g_row[amount_col] if amount_col in g_row.index else 0
+                eff_val = g_row['Эффект_руб'] if 'Эффект_руб' in g_row.index else 0
+                print(f"      {i:<4} {str(msisdn):<15} {base_val:<15.2f} {curr_val:<15.2f} {eff_val:<15.2f}")
+            
+            # Статистика по эффекту
+            positive = (group_data['Эффект_руб'] > 0).sum()
+            zero = (group_data['Эффект_руб'] == 0).sum()
+            negative = (group_data['Эффект_руб'] < 0).sum()
+            print(f"\n      Статистика по эффекту:")
+            print(f"      - Положительный (>0): {positive} MSISDN")
+            print(f"      - Нулевой (=0): {zero} MSISDN")
+            print(f"      - Отрицательный (<0, обнулены): {negative} MSISDN")
+            
+            # Дополнительно: показываем MSISDN с отрицательным эффектом (если есть)
+            if negative > 0:
+                neg_data = group_data[group_data['Эффект_руб'] < 0]
+                print(f"\n      ⚠️  MSISDN с отрицательным эффектом (обнулены):")
+                for i, (_, g_row) in enumerate(neg_data.iterrows(), 1):
+                    msisdn = g_row[id_col] if id_col in g_row.index else "N/A"
+                    base_val = g_row[base_col] if base_col in g_row.index else 0
+                    curr_val = g_row[amount_col] if amount_col in g_row.index else 0
+                    eff_val = g_row['Эффект_руб'] if 'Эффект_руб' in g_row.index else 0
+                    print(f"      [{i}] MSISDN: {msisdn}, До: {base_val:.2f}, Текущее: {curr_val:.2f}, Эффект: {eff_val:.2f}")
+        else:
+            print(f"      ⚠️  Нет данных в debug_merged для этой группы!")
