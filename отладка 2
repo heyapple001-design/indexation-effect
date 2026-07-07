@@ -1,3 +1,1002 @@
+"""
+Расчёт фактического эффекта от индексации.
+UI: плоский стиль Windows 10 (акцент #0078D4).
+
+Поддерживает два режима расчёта эффекта для каждой базы:
+  • РЕЖИМ A — начисления в отдельном файле (MSISDN + сумма за месяц)
+  • РЕЖИМ B — начисления в той же базе (отдельная колонка с текущей суммой)
+"""
+
+from __future__ import annotations
+
+import pandas as pd
+import os
+import tkinter as tk
+from tkinter import filedialog, ttk, messagebox
+from datetime import datetime
+from collections import defaultdict
+from typing import Any, Optional
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+
+# ══════════════════════════════════════════════════════════════
+#  КОНСТАНТЫ / ДАННЫЕ
+# ══════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════
+#  ЗАГРУЗКА СПРАВОЧНИКОВ ИЗ JSON
+# ══════════════════════════════════════════════════════════════
+
+def _load_mappings():
+    """Загружает справочники МРФ/РФ и написания услуг из data/mappings.json.
+    Файл должен лежать рядом с программой в папке data/.
+    """
+    import json, pathlib
+    json_path = pathlib.Path(__file__).parent / "data" / "mappings.json"
+    if not json_path.exists():
+        raise FileNotFoundError(
+            f"Файл справочников не найден: {json_path}\n"
+            "Убедитесь что папка data/ с файлом mappings.json лежит рядом с программой."
+        )
+    with open(json_path, encoding="utf-8") as f:
+        m = json.load(f)
+    return m
+
+_mappings = _load_mappings()
+
+ALL_MRF           = _mappings["ALL_MRF"]
+MRF_TO_RF         = _mappings["MRF_TO_RF"]
+RF_MAPPING        = _mappings["RF_MAPPING"]
+RF_REVERSE        = _mappings["RF_REVERSE"]
+UPPERCASE_SERVICES = set(_mappings["UPPERCASE_SERVICES"])
+SERVICE_EXACT     = _mappings["SERVICE_EXACT"]
+MRF_EXACT         = _mappings["MRF_EXACT"]
+
+# ── Названия листов в файлах ──────────────────────────────────
+SHEET_TABLE2: str = "Лист1"                        # База индексации
+SHEET_TABLE1: str = "Sheet"                        # Начисления (отдельный файл)
+SHEET_TABLE3: str = "Факт-эффект индексации 2026"  # Отчёт
+
+# ── Колонки базы индексации ────────────────────────────────────
+BASE_COL_SERVICE:  str = "Услуга"
+BASE_COL_DATE:     str = "Дата индексации"
+BASE_COL_PCT:      str = "% индексации"
+BASE_COL_MRF:      str = "МРФ"
+BASE_COL_RF:       str = "РФ"
+BASE_COL_SEGMENT:  str = "Краткий сегмент"   # строчная «с»
+BASE_COL_SUBSEG:   str = "Подсегмент"
+BASE_COL_SEGMENT1: str = "Сегмент1"          # → идёт в колонку «Сегмент» отчёта
+
+# ── Колонки отчёта ─────────────────────────────────────────────
+RPT_COL_SERVICE:   str = "Услуга"
+RPT_COL_DATE:      str = "Дата индексации"
+RPT_COL_PCT:       str = "Процент индексации"
+RPT_COL_MRF:       str = "МРФ"
+RPT_COL_RF:        str = "РФ"
+RPT_COL_SEGMENT:   str = "Краткий Сегмент"   # заглавная «С»
+RPT_COL_SUBSEG:    str = "Подсегмент"
+RPT_COL_SEGMENT1:  str = "Сегмент"           # ← вот эта константа отсутствовала!
+
+# ── Вспомогательные функции нормализации значений ────────────
+def unmap_rf(canon_value: Any) -> str:
+    """Конвертирует канонический 'ФЭС ...' (или любое написание) в полное
+    официальное название филиала. Напр: 'фэс тюменский' →
+    'Филиал в Тюменской и Курганской областях'."""
+    key = " ".join(str(canon_value).replace("\xa0", " ").strip().lower().split())
+    return RF_REVERSE.get(key, canon_value)   # если не нашли — возвращаем как есть
+
+def fmt_title(x: Any) -> Any:
+    """Первое слово с заглавной, остальное строчное. Напр: 'ВПН' → 'Впн'."""
+    if pd.isna(x) or str(x).strip() == "":
+        return x
+    s = str(x).strip()
+    return s[0].upper() + s[1:].lower()
+
+def fmt_lower(x: Any) -> Any:
+    """Всё строчными."""
+    if pd.isna(x) or str(x).strip() == "":
+        return x
+    return str(x).strip().lower()
+
+def fmt_upper(x: Any) -> Any:
+    """Всё заглавными (UPPERCASE)."""
+    if pd.isna(x) or str(x).strip() == "":
+        return x
+    return str(x).strip().upper()
+
+def fmt_mrf(x: Any) -> Any:
+    """Нормализует название МРФ по эталонному словарю MRF_EXACT."""
+    if pd.isna(x) or str(x).strip() == "":
+        return x
+    key = str(x).strip().lower()
+    if key in MRF_EXACT:
+        return MRF_EXACT[key]
+    return fmt_title(x)   # для неизвестных МРФ — первое с заглавной
+
+
+def fmt_service(x: Any) -> Any:
+    """Форматирует название услуги:
+    - Точные совпадения из SERVICE_EXACT → эталонное написание
+    - Услуги из UPPERCASE_SERVICES → UPPERCASE (IPTV, VPN, ШПД и др.)
+    - Остальные → первое слово с заглавной (fmt_title)
+    """
+    if pd.isna(x) or str(x).strip() == "":
+        return x
+    s = str(x).strip()
+    # Проверяем точные совпадения (нечувствительно к регистру)
+    key = s.lower()
+    if key in SERVICE_EXACT:
+        return SERVICE_EXACT[key]
+    if key in UPPERCASE_SERVICES:
+        return s.upper()
+    return fmt_title(s)
+
+def fmt_seg(x: Any) -> Any:
+    """Форматирует сегмент/подсегмент по правилу:
+    - Слова с латиницей/цифрами → UPPERCASE  (B2B, 3К, B2G)
+    - Кириллические аббревиатуры → UPPERCASE  (МСП, ККФУ, ДНК, РУ, ФУ)
+    - Обычные кириллические слова → первая заглавная  (Прочие, Топ, Средний)
+    Примеры: 'прочие 3к' → 'Прочие 3К', 'b2b ккфу' → 'B2B ККФУ'
+    """
+    import re
+    if pd.isna(x) or str(x).strip() == "":
+        return x
+    s = str(x).strip()
+    ABBREVS = {'мсп', 'смп', 'мрф', 'фэс', 'днк', 'ккфу', 'фу', 'ру', 'вп', 'оп', 'нк', 'топ'}
+    result = []
+    for word in s.split():
+        if re.search(r'[a-zA-Z0-9]', word):
+            result.append(word.upper())
+        elif word.lower() in ABBREVS:
+            result.append(word.upper())
+        else:
+            result.append(word.capitalize())
+    return ' '.join(result)
+
+def fmt_pct(x: Any) -> Any:
+    """Приводим % к числу 0..1 если значение > 1 (например 5 → 0.05)."""
+    try:
+        v = float(str(x).replace(",", ".").replace("%", "").strip())
+        return v / 100 if v > 1 else v
+    except (ValueError, TypeError):
+        return x
+
+def fmt_num3(x: Any) -> Any:
+    """Число с 3 знаками после запятой."""
+    try:
+        return round(float(x), 3)
+    except (ValueError, TypeError):
+        return x
+
+# ── Поиск целевой колонки (эффект) ───────────────────────────
+# Все месяцы: ищем колонку содержащую месяц + "эффект от индексации" + "факт"
+TARGET_COL_KEYWORDS = ["эффект от индексации", "факт"]
+
+# ── Заливки ───────────────────────────────────────────────────
+FILL_UPDATED   = "C6EFCE"   # зелёный  — обновлено
+FILL_ADDED     = "DDEBF7"   # синий    — добавлено
+FILL_NOT_FOUND = "FFEB9C"   # жёлтый   — не найден в базе
+
+# ── Режимы источника начислений ───────────────────────────────
+MODE_EXTERNAL = "external"   # начисления в отдельном файле (РЕЖИМ A)
+MODE_INBASE   = "inbase"     # начисления в той же базе     (РЕЖИМ B)
+
+# ══════════════════════════════════════════════════════════════
+#  ЦВЕТА / ТЕМА
+# ══════════════════════════════════════════════════════════════
+C_BG        = "#FFFFFF"
+C_BG_PANEL  = "#F3F3F3"
+C_ACCENT    = "#0078D4"
+C_ACCENT_H  = "#106EBE"
+C_ACCENT_P  = "#005A9E"
+C_TEXT      = "#1A1A1A"
+C_TEXT_HINT = "#767676"
+C_BORDER    = "#D1D1D1"
+C_SEL_BG    = "#CCE4F7"
+C_HDR_BG    = "#0078D4"
+C_HDR_FG    = "#FFFFFF"
+
+FONT_TITLE  = ("Segoe UI", 13, "bold")
+FONT_LABEL  = ("Segoe UI", 10)
+FONT_SMALL  = ("Segoe UI", 9)
+FONT_MONO   = ("Consolas", 9)
+FONT_BTN    = ("Segoe UI", 10)
+
+# ══════════════════════════════════════════════════════════════
+#  БАЗОВЫЕ УТИЛИТЫ
+# ══════════════════════════════════════════════════════════════
+
+def find_col_name(df: pd.DataFrame, name: str) -> Optional[str]:
+    """Ищет колонку в df нечувствительно к регистру, возвращает реальное имя."""
+    name_lower = name.strip().lower()
+    for c in df.columns:
+        if str(c).strip().lower() == name_lower:
+            return c
+    return None
+
+
+def norm_text(x: Any) -> str:
+    if pd.isna(x): return ""
+    return " ".join(str(x).replace("\xa0", " ").strip().lower().split())
+
+def norm_date(x: Any) -> str:
+    """Нормализует дату к строке DD.MM.YYYY для отображения и сравнения."""
+    if x is None: return ""
+    try:
+        if pd.isna(x): return ""
+    except TypeError:
+        pass
+    dt = pd.to_datetime(x, errors="coerce", dayfirst=True)
+    if pd.isna(dt): return str(x).strip()
+    return dt.strftime("%d.%m.%Y")
+
+def map_rf(raw_value: Any) -> str:
+    raw_str = str(raw_value).strip()
+    if raw_str in RF_MAPPING:        return norm_text(RF_MAPPING[raw_str])
+    raw_lower = raw_str.lower()
+    if raw_lower in RF_MAPPING:      return norm_text(RF_MAPPING[raw_lower])
+    return norm_text(raw_str)
+
+def center(root: tk.Tk, w: int, h: int) -> None:
+    root.update_idletasks()
+    root.geometry(f"{w}x{h}+{(root.winfo_screenwidth()-w)//2}+{(root.winfo_screenheight()-h)//2}")
+
+def topmost(root: tk.Tk) -> None:
+    root.lift(); root.attributes("-topmost", True); root.focus_force()
+
+# ══════════════════════════════════════════════════════════════
+#  ТЕМА TTK
+# ══════════════════════════════════════════════════════════════
+
+def apply_theme(root: tk.Tk) -> None:
+    s = ttk.Style(root)
+    s.theme_use("clam")
+    s.configure(".", background=C_BG, foreground=C_TEXT, font=FONT_LABEL, relief="flat", borderwidth=0)
+    s.configure("TFrame", background=C_BG)
+    s.configure("Panel.TFrame", background=C_BG_PANEL)
+    s.configure("TLabelframe", background=C_BG, bordercolor=C_BORDER, relief="solid", borderwidth=1)
+    s.configure("TLabelframe.Label", background=C_BG, foreground=C_ACCENT, font=("Segoe UI", 9, "bold"))
+    s.configure("TLabel", background=C_BG, foreground=C_TEXT, font=FONT_LABEL)
+    s.configure("Title.TLabel",  background=C_BG, foreground=C_TEXT,     font=FONT_TITLE)
+    s.configure("Hint.TLabel",   background=C_BG, foreground=C_TEXT_HINT, font=FONT_SMALL)
+    s.configure("Header.TLabel", background=C_HDR_BG, foreground=C_HDR_FG, font=FONT_TITLE)
+    s.configure("Accent.TButton", background=C_ACCENT, foreground="#FFFFFF",
+                font=FONT_BTN, relief="flat", borderwidth=0, padding=(16, 8), focuscolor=C_ACCENT)
+    s.map("Accent.TButton",
+          background=[("active", C_ACCENT_H), ("pressed", C_ACCENT_P), ("disabled", "#A8C7E3")],
+          foreground=[("disabled", "#FFFFFF")])
+    s.configure("Secondary.TButton", background=C_BG_PANEL, foreground=C_TEXT,
+                font=FONT_BTN, relief="solid", borderwidth=1,
+                bordercolor=C_BORDER, padding=(16, 8), focuscolor=C_BG_PANEL)
+    s.map("Secondary.TButton",
+          background=[("active", "#E5E5E5"), ("pressed", "#D5D5D5")],
+          bordercolor=[("active", C_ACCENT)])
+    s.configure("Danger.TButton", background="#C42B1C", foreground="#FFFFFF",
+                font=FONT_BTN, relief="flat", borderwidth=0, padding=(16, 8))
+    s.map("Danger.TButton", background=[("active", "#A11E12"), ("pressed", "#8A1910")])
+    s.configure("TEntry", fieldbackground=C_BG, foreground=C_TEXT,
+                bordercolor=C_BORDER, lightcolor=C_BG, darkcolor=C_BG,
+                relief="solid", borderwidth=1, padding=(6, 4))
+    s.map("TEntry", bordercolor=[("focus", C_ACCENT)])
+    s.configure("TCombobox", fieldbackground=C_BG, background=C_BG,
+                foreground=C_TEXT, selectbackground=C_SEL_BG, selectforeground=C_TEXT,
+                arrowcolor=C_ACCENT, bordercolor=C_BORDER, relief="solid", borderwidth=1, padding=(6, 4))
+    s.map("TCombobox", bordercolor=[("focus", C_ACCENT)])
+    s.configure("TCheckbutton", background=C_BG, foreground=C_TEXT, font=FONT_LABEL, focuscolor=C_BG)
+    s.map("TCheckbutton", background=[("active", C_BG)], foreground=[("active", C_ACCENT)])
+    s.configure("TScrollbar", background=C_BG_PANEL, troughcolor=C_BG_PANEL,
+                bordercolor=C_BG_PANEL, arrowcolor=C_TEXT_HINT, relief="flat", borderwidth=0)
+    s.map("TScrollbar", background=[("active", C_ACCENT), ("pressed", C_ACCENT_H)])
+    s.configure("TSeparator", background=C_BORDER)
+
+# ══════════════════════════════════════════════════════════════
+#  UI-КОМПОНЕНТЫ
+# ══════════════════════════════════════════════════════════════
+
+class WaitingWindow:
+    """
+    Информационное окно «⏳ Пожалуйста, подождите...»
+
+    Реализовано через tk.Toplevel от единственного _FILE_ROOT —
+    НЕ создаёт новый Tk(), что устраняет конфликты и зависания.
+    """
+    def __init__(self, title: str = "⏳ Пожалуйста, подождите",
+                 message: str = "Идёт обработка данных...") -> None:
+        self._win: Optional[tk.Toplevel] = None
+        try:
+            parent = _get_file_root()
+            win = tk.Toplevel(parent)
+            self._win = win
+            win.title(title)
+            win.resizable(False, False)
+            win.attributes("-topmost", True)
+            win.configure(bg=C_BG)
+            win.protocol("WM_DELETE_WINDOW", lambda: None)
+
+            w_px, h_px = 440, 170
+            win.update_idletasks()
+            sw = win.winfo_screenwidth()
+            sh = win.winfo_screenheight()
+            win.geometry(f"{w_px}x{h_px}+{(sw-w_px)//2}+{(sh-h_px)//2}")
+
+            # Шапка
+            bar = tk.Frame(win, bg=C_HDR_BG, height=48)
+            bar.pack(fill=tk.X); bar.pack_propagate(False)
+            tk.Label(bar, text=title, bg=C_HDR_BG, fg=C_HDR_FG,
+                     font=FONT_TITLE, anchor="w").pack(side=tk.LEFT, padx=16, pady=8)
+
+            # Тело
+            body = tk.Frame(win, bg=C_BG)
+            body.pack(fill=tk.BOTH, expand=True, padx=24, pady=12)
+            tk.Label(body, text=message, bg=C_BG, fg=C_TEXT,
+                     font=FONT_LABEL, wraplength=380, justify="center").pack(expand=True)
+
+            # Анимированные точки
+            self._dot_count = 0
+            self._anim_lbl = tk.Label(body, text="●○○", bg=C_BG,
+                                       fg=C_ACCENT, font=("Segoe UI", 14))
+            self._anim_lbl.pack(pady=(4, 0))
+
+            def _animate() -> None:
+                if self._win is None: return
+                self._dot_count = (self._dot_count + 1) % 4
+                dots = "●" * self._dot_count + "○" * (3 - self._dot_count)
+                try:
+                    self._anim_lbl.config(text=dots)
+                    self._win.after(350, _animate)
+                except tk.TclError:
+                    pass
+
+            win.after(0, _animate)
+            win.update()
+
+        except tk.TclError as e:
+            print(f"  {title}: {message}")
+            self._win = None
+
+    def update(self) -> None:
+        """Обновляет отрисовку."""
+        if self._win:
+            try:
+                self._win.update()
+            except tk.TclError:
+                pass
+
+    def close(self) -> None:
+        """Закрывает окно ожидания."""
+        if self._win:
+            try:
+                self._win.destroy()
+            except tk.TclError:
+                pass
+            self._win = None
+
+
+def make_window(title: str, w: int, h: int, resizable: bool = False) -> tk.Toplevel:
+    """Создаёт диалоговое окно как Toplevel от _FILE_ROOT.
+    Это предотвращает конфликт нескольких Tk()-экземпляров.
+    Вместо mainloop() используйте _get_file_root().wait_window(win) — оно работает
+    через wait_window на родительском root.
+    """
+    parent = _get_file_root()
+    root = tk.Toplevel(parent)
+    root.title(title)
+    root.configure(bg=C_BG)
+    root.resizable(resizable, resizable)
+    apply_theme(root)
+    center(root, w, h)
+    topmost(root)
+    root.protocol("WM_DELETE_WINDOW", root.destroy)
+    return root
+
+def header_bar(parent, text):
+    bar = tk.Frame(parent, bg=C_HDR_BG, height=52)
+    bar.pack(fill=tk.X); bar.pack_propagate(False)
+    tk.Label(bar, text=text, bg=C_HDR_BG, fg=C_HDR_FG,
+             font=FONT_TITLE, anchor="w").pack(side=tk.LEFT, padx=20, pady=10)
+    return bar
+
+def flat_button(parent, text, command, style="Accent.TButton", width=None, **kw):
+    b = ttk.Button(parent, text=text, command=command, style=style, **kw)
+    if width: b.configure(width=width)
+    return b
+
+def styled_listbox(parent):
+    return tk.Listbox(parent, font=FONT_MONO, bg=C_BG, fg=C_TEXT,
+                      selectbackground=C_ACCENT, selectforeground="#FFFFFF",
+                      activestyle="none", relief="flat", bd=0,
+                      highlightthickness=1, highlightcolor=C_ACCENT,
+                      highlightbackground=C_BORDER)
+
+def scroll_canvas(parent, bg=None):
+    bg = bg or C_BG
+    cv = tk.Canvas(parent, bg=bg, highlightthickness=0)
+    sb = ttk.Scrollbar(parent, orient="vertical", command=cv.yview)
+    sf = tk.Frame(cv, bg=bg)
+    sf.bind("<Configure>", lambda e: cv.configure(scrollregion=cv.bbox("all")))
+    cv.create_window((0, 0), window=sf, anchor="nw")
+    cv.configure(yscrollcommand=sb.set)
+    cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    sb.pack(side=tk.RIGHT, fill=tk.Y)
+    def _mw(e): cv.yview_scroll(int(-1*(e.delta/120)), "units")
+    for w in (cv, sf):
+        w.bind("<MouseWheel>", _mw)
+        w.bind("<Button-4>", lambda e: cv.yview_scroll(-1, "units"))
+        w.bind("<Button-5>", lambda e: cv.yview_scroll( 1, "units"))
+    return cv, sf
+
+def separator(parent: tk.Widget, pady: int = 4) -> None:
+    ttk.Separator(parent, orient="horizontal").pack(fill=tk.X, padx=0, pady=pady)
+
+# ══════════════════════════════════════════════════════════════
+#  ДИАЛОГИ
+# ══════════════════════════════════════════════════════════════
+
+# Единственный скрытый Tk-root для файловых диалогов.
+# Создаётся один раз и переиспользуется — предотвращает утечку ресурсов
+# при 100+ вызовах select_file/select_save_file за сессию.
+_FILE_ROOT: "tk.Tk | None" = None
+
+def _get_file_root() -> "tk.Tk":
+    """Возвращает (создавая при необходимости) единый скрытый root для диалогов."""
+    global _FILE_ROOT
+    if _FILE_ROOT is None:
+        _FILE_ROOT = tk.Tk()
+        _FILE_ROOT.withdraw()
+        _FILE_ROOT.attributes("-topmost", True)
+    else:
+        # Убеждаемся что окно живо (могло быть уничтожено WaitingWindow)
+        try:
+            _FILE_ROOT.state()
+        except tk.TclError:
+            _FILE_ROOT = tk.Tk()
+            _FILE_ROOT.withdraw()
+            _FILE_ROOT.attributes("-topmost", True)
+    return _FILE_ROOT
+
+
+def select_file(title: str) -> str:
+    root = _get_file_root()
+    root.lift()
+    f = filedialog.askopenfilename(
+        title=title, filetypes=[("Excel files", "*.xlsx"), ("All files", "*.*")],
+        initialdir=os.path.expanduser("~/Desktop"),
+        parent=root)
+    return f
+
+def select_save_file(title: str, initialfile: str) -> str:
+    root = _get_file_root()
+    root.lift()
+    f = filedialog.asksaveasfilename(
+        title=title, initialfile=initialfile, defaultextension=".xlsx",
+        filetypes=[("Excel files", "*.xlsx")],
+        initialdir=os.path.expanduser("~/Desktop"),
+        parent=root)
+    return f
+
+def select_month() -> Optional[str]:
+    months = ["январь","февраль","март","апрель","май","июнь",
+              "июль","август","сентябрь","октябрь","ноябрь","декабрь"]
+    win = make_window("Выбор месяца", 380, 230); result = [None]
+    header_bar(win, "Расчёт эффекта индексации")
+    body = tk.Frame(win, bg=C_BG); body.pack(fill=tk.BOTH, expand=True, padx=24, pady=16)
+    tk.Label(body, text="Выберите отчётный месяц:", bg=C_BG, fg=C_TEXT, font=FONT_LABEL).pack(anchor="w", pady=(0,8))
+    var = tk.StringVar(value="апрель")
+    ttk.Combobox(body, textvariable=var, values=months, state="readonly",
+                 font=FONT_LABEL, width=18).pack(anchor="w", pady=(0,16))
+    def ok(): result[0] = var.get(); win.destroy()
+    flat_button(body, "Продолжить →", ok, width=18).pack(anchor="w")
+    _get_file_root().wait_window(win); return result[0]
+
+def ask_charges_mode(base_name: str, mrf_name: str) -> Optional[str]:
+    """
+    Диалог: начисления в отдельном файле или в этой базе?
+    Возвращает MODE_EXTERNAL или MODE_INBASE.
+    """
+    win = make_window("Источник начислений", 560, 280)
+    result = [None]
+    header_bar(win, "Источник начислений")
+
+    body = tk.Frame(win, bg=C_BG); body.pack(fill=tk.BOTH, expand=True, padx=24, pady=16)
+    tk.Label(body,
+             text=f"МРФ {mrf_name}  |  База: {base_name}",
+             bg=C_BG, fg=C_TEXT_HINT, font=FONT_SMALL).pack(anchor="w", pady=(0,4))
+    tk.Label(body,
+             text="Где хранятся текущие начисления для этой базы?",
+             bg=C_BG, fg=C_TEXT, font=FONT_LABEL).pack(anchor="w", pady=(0,16))
+
+    def choose(mode): result[0] = mode; win.destroy()
+
+    # Кнопка A
+    card_a = tk.Frame(body, bg=C_BG_PANEL, relief="solid", bd=1)
+    card_a.pack(fill=tk.X, pady=4)
+    inner_a = tk.Frame(card_a, bg=C_BG_PANEL); inner_a.pack(fill=tk.X, padx=12, pady=10)
+    tk.Label(inner_a, text="📂  В отдельном файле начислений",
+             bg=C_BG_PANEL, fg=C_TEXT, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+    tk.Label(inner_a,
+             text="Стандартный файл с листом «Sheet», колонками MSISDN и «Без НДС месяц»",
+             bg=C_BG_PANEL, fg=C_TEXT_HINT, font=FONT_SMALL).pack(anchor="w")
+    card_a.bind("<Button-1>", lambda e: choose(MODE_EXTERNAL))
+    inner_a.bind("<Button-1>", lambda e: choose(MODE_EXTERNAL))
+    for w in inner_a.winfo_children():
+        w.bind("<Button-1>", lambda e: choose(MODE_EXTERNAL))
+    card_a.configure(cursor="hand2"); inner_a.configure(cursor="hand2")
+
+    # Кнопка B
+    card_b = tk.Frame(body, bg="#EFF6FF", relief="solid", bd=1)
+    card_b.pack(fill=tk.X, pady=4)
+    inner_b = tk.Frame(card_b, bg="#EFF6FF"); inner_b.pack(fill=tk.X, padx=12, pady=10)
+    tk.Label(inner_b, text="📊  В этой базе индексации",
+             bg="#EFF6FF", fg=C_ACCENT, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+    tk.Label(inner_b,
+             text="Колонка с текущим начислением находится прямо в файле базы\n"
+                  "(например: Кабельная канализация, Радиовещание, Транспортная сеть)",
+             bg="#EFF6FF", fg=C_TEXT_HINT, font=FONT_SMALL).pack(anchor="w")
+    card_b.bind("<Button-1>", lambda e: choose(MODE_INBASE))
+    inner_b.bind("<Button-1>", lambda e: choose(MODE_INBASE))
+    for w in inner_b.winfo_children():
+        w.bind("<Button-1>", lambda e: choose(MODE_INBASE))
+    card_b.configure(cursor="hand2"); inner_b.configure(cursor="hand2")
+
+    _get_file_root().wait_window(win); return result[0]
+
+def select_mrf_window() -> Optional[list[str]]:
+    win = make_window("Выбор МРФ", 680, 640, resizable=True); result = [None]
+    header_bar(win, "Выберите МРФ для обработки")
+    hint = tk.Frame(win, bg=C_BG_PANEL); hint.pack(fill=tk.X)
+    tk.Label(hint, text="  Отметьте МРФ, которые нужно обработать. Обработка идёт последовательно.",
+             bg=C_BG_PANEL, fg=C_TEXT_HINT, font=FONT_SMALL).pack(anchor="w", pady=6, padx=12)
+    separator(win)
+    scroll_area = tk.Frame(win, bg=C_BG); scroll_area.pack(fill=tk.BOTH, expand=True)
+    cv, sf = scroll_canvas(scroll_area)
+    vars_ = {}
+    for mrf in sorted(ALL_MRF):
+        rf_list = MRF_TO_RF.get(mrf, [])
+        card = tk.Frame(sf, bg=C_BG); card.pack(fill=tk.X, padx=12, pady=4)
+        top_row = tk.Frame(card, bg=C_BG); top_row.pack(fill=tk.X)
+        var = tk.BooleanVar(value=False); vars_[mrf] = var
+        tk.Checkbutton(top_row, text=f"  МРФ {fmt_mrf(mrf)}", variable=var,
+                       bg=C_BG, fg=C_TEXT, activebackground=C_BG, activeforeground=C_ACCENT,
+                       selectcolor=C_BG, font=("Segoe UI", 11, "bold"),
+                       relief="flat", bd=0, cursor="hand2", anchor="w").pack(side=tk.LEFT)
+        if rf_list:
+            tk.Label(card, text="        " + " · ".join(rf_list),
+                     bg=C_BG, fg=C_TEXT_HINT, font=FONT_SMALL,
+                     wraplength=600, justify="left", anchor="w").pack(fill=tk.X, padx=4, pady=(0,2))
+        tk.Frame(card, bg=C_BORDER, height=1).pack(fill=tk.X, pady=(4,0))
+    separator(win)
+    btn_row = tk.Frame(win, bg=C_BG); btn_row.pack(pady=12, padx=16, fill=tk.X)
+    def sel_all():
+        for v in vars_.values(): v.set(True)
+    def desel_all():
+        for v in vars_.values(): v.set(False)
+    def ok():
+        chosen = [m for m, v in vars_.items() if v.get()]
+        if not chosen: messagebox.showwarning("Внимание", "Выберите хотя бы один МРФ!", parent=win); return
+        result[0] = chosen; win.destroy()
+    flat_button(btn_row, "Начать обработку →", ok, width=20).pack(side=tk.LEFT)
+    flat_button(btn_row, "✓ Все", sel_all, style="Secondary.TButton", width=10).pack(side=tk.LEFT, padx=(10,4))
+    flat_button(btn_row, "✗ Снять", desel_all, style="Secondary.TButton", width=10).pack(side=tk.LEFT)
+    _get_file_root().wait_window(win); return result[0]
+
+def select_column(df_columns: pd.Index, title_text: str, instruction_text: str) -> Optional[str]:
+    win = make_window(title_text, 680, 540, resizable=True); result = [None]
+    header_bar(win, title_text)
+    body = tk.Frame(win, bg=C_BG); body.pack(fill=tk.BOTH, expand=True, padx=16, pady=10)
+    tk.Label(body, text=instruction_text, bg=C_BG, fg=C_TEXT_HINT,
+             font=FONT_SMALL, wraplength=640, justify="left").pack(anchor="w", pady=(0,8))
+    search_row = tk.Frame(body, bg=C_BG); search_row.pack(fill=tk.X, pady=(0,6))
+    tk.Label(search_row, text="🔍  Поиск:", bg=C_BG, fg=C_TEXT, font=FONT_LABEL).pack(side=tk.LEFT)
+    sv = tk.StringVar()
+    se = ttk.Entry(search_row, textvariable=sv, font=FONT_LABEL, width=42)
+    se.pack(side=tk.LEFT, padx=(8,0), fill=tk.X, expand=True); se.focus_set()
+    lo = tk.Frame(body, bg=C_BORDER, padx=1, pady=1); lo.pack(fill=tk.BOTH, expand=True)
+    lf = tk.Frame(lo, bg=C_BG); lf.pack(fill=tk.BOTH, expand=True)
+    sb = ttk.Scrollbar(lf); sb.pack(side=tk.RIGHT, fill=tk.Y)
+    lb = styled_listbox(lf); lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    sb.config(command=lb.yview); lb.config(yscrollcommand=sb.set)
+    all_cols = list(df_columns)
+    for c in all_cols: lb.insert(tk.END, c)
+    def update(*_):
+        q = sv.get().lower(); lb.delete(0, tk.END)
+        for c in all_cols:
+            if q in c.lower(): lb.insert(tk.END, c)
+    sv.trace("w", update)
+    def pick(*_):
+        sel = lb.curselection()
+        if sel: result[0] = lb.get(sel[0]); win.destroy()
+    lb.bind("<Double-Button-1>", pick); lb.bind("<Return>", pick)
+    separator(body)
+    br = tk.Frame(body, bg=C_BG); br.pack(fill=tk.X, pady=(4,0))
+    flat_button(br, "Выбрать", pick, width=14).pack(side=tk.LEFT)
+    flat_button(br, "Отмена", win.destroy, style="Secondary.TButton", width=10).pack(side=tk.LEFT, padx=10)
+    _get_file_root().wait_window(win); return result[0]
+
+def ask_yes_no(title: str, text: str) -> bool:
+    win = make_window(title, 460, 195); result = [None]
+    header_bar(win, title)
+    body = tk.Frame(win, bg=C_BG); body.pack(fill=tk.BOTH, expand=True, padx=24, pady=16)
+    tk.Label(body, text=text, bg=C_BG, fg=C_TEXT, font=FONT_LABEL,
+             wraplength=400, justify="left").pack(anchor="w", pady=(0,18))
+    br = tk.Frame(body, bg=C_BG); br.pack(fill=tk.X)
+    def yes(): result[0] = True;  win.destroy()
+    def no():  result[0] = False; win.destroy()
+    flat_button(br, "Да",  yes, width=12).pack(side=tk.LEFT)
+    flat_button(br, "Нет", no, style="Secondary.TButton", width=12).pack(side=tk.LEFT, padx=10)
+    _get_file_root().wait_window(win); return result[0]
+
+class SessionLog:
+    """
+    Небольшое окно-журнал сессии — показывает какие файлы уже загружены.
+    Обновляется по мере работы программы. Всегда поверх других окон.
+    """
+    def __init__(self) -> None:
+        self._win: Optional[tk.Toplevel] = None
+        self._text: Optional[tk.Text] = None
+        self._lines: list[str] = []
+
+    def show(self, title: str = "📋 Файлы сессии") -> None:
+        """Создаёт окно журнала (вызвать один раз при старте)."""
+        parent = _get_file_root()
+        win = tk.Toplevel(parent)
+        self._win = win
+        win.title(title)
+        win.resizable(True, False)
+        win.attributes("-topmost", True)
+        win.configure(bg=C_BG)
+        win.protocol("WM_DELETE_WINDOW", lambda: None)  # нельзя закрыть вручную
+
+        # Позиционируем в правом верхнем углу
+        w_px, h_px = 500, 280
+        win.update_idletasks()
+        sw = win.winfo_screenwidth()
+        win.geometry(f"{w_px}x{h_px}+{sw - w_px - 20}+20")
+
+        # Шапка
+        bar = tk.Frame(win, bg=C_HDR_BG, height=40)
+        bar.pack(fill=tk.X); bar.pack_propagate(False)
+        tk.Label(bar, text=title, bg=C_HDR_BG, fg=C_HDR_FG,
+                 font=("Segoe UI", 10, "bold"), anchor="w").pack(
+                 side=tk.LEFT, padx=12, pady=8)
+
+        # Текстовое поле
+        body = tk.Frame(win, bg=C_BG); body.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        self._text = tk.Text(body, wrap=tk.WORD, font=("Segoe UI", 9),
+                             bg=C_BG, fg=C_TEXT, relief="flat", bd=0,
+                             highlightthickness=0, state=tk.DISABLED, height=12)
+        sb = ttk.Scrollbar(body, command=self._text.yview)
+        self._text.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self._refresh()
+        win.lift()
+        win.focus_force()
+        # После показа снимаем жёсткий topmost — чтобы не перекрывала диалоги
+        win.after(500, lambda: win.attributes("-topmost", False) if self._win else None)
+        win.update()
+
+    def add(self, label: str, filepath: str) -> None:
+        """Добавляет строку: что за файл и его имя."""
+        import os
+        name = os.path.basename(filepath) if filepath else "—"
+        self._lines.append(f"  {label}: {name}")
+        self._refresh()
+
+    def add_text(self, text: str) -> None:
+        """Добавляет произвольную строку-разделитель или заголовок."""
+        self._lines.append(text)
+        self._refresh()
+
+    def _refresh(self) -> None:
+        if self._text is None: return
+        try:
+            self._text.config(state=tk.NORMAL)
+            self._text.delete("1.0", tk.END)
+            self._text.insert(tk.END, "\n".join(self._lines))
+            self._text.see(tk.END)
+            self._text.config(state=tk.DISABLED)
+            if self._win:
+                self._win.update()
+        except tk.TclError:
+            pass
+
+    def close(self) -> None:
+        """Закрывает журнал."""
+        if self._win:
+            try: self._win.destroy()
+            except tk.TclError: pass
+            self._win = None
+
+
+# Глобальный журнал сессии
+_session_log = SessionLog()
+
+
+def show_progress(message: str, title: str = "Готово") -> None:
+    win = make_window(title, 700, 560, resizable=True)
+    header_bar(win, title)
+    area = tk.Frame(win, bg=C_BG); area.pack(fill=tk.BOTH, expand=True, padx=16, pady=10)
+    tw = tk.Text(area, wrap=tk.WORD, font=FONT_LABEL, bg=C_BG, fg=C_TEXT,
+                 relief="flat", bd=0, highlightthickness=0, selectbackground=C_SEL_BG)
+    sb = ttk.Scrollbar(area, command=tw.yview); tw.configure(yscrollcommand=sb.set)
+    sb.pack(side=tk.RIGHT, fill=tk.Y); tw.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    tw.insert(tk.END, message); tw.config(state=tk.DISABLED)
+    separator(win)
+    flat_button(win, "Закрыть", win.destroy, width=14).pack(pady=10)
+    _get_file_root().wait_window(win)
+
+def filter_window(df_report: pd.DataFrame, mrf_name: str = "") -> Optional[dict]:
+    cols = [c for c in [RPT_COL_SERVICE, RPT_COL_MRF, RPT_COL_RF, RPT_COL_SEGMENT, RPT_COL_SUBSEG]
+            if c in df_report.columns]
+    if not cols: return None
+
+    result = {"selected": None, "date": None}
+    win_title = f"Фильтры — МРФ {mrf_name}" if mrf_name else "Фильтры"
+    win = make_window(win_title, 1060, 860, resizable=True)
+    # Закрытие через [X] = отмена фильтров
+    def _on_filter_close() -> None:
+        result["selected"] = None
+        result["date"]     = None
+        win.destroy()
+    win.protocol("WM_DELETE_WINDOW", _on_filter_close)
+    header_bar(win, win_title)
+    hint_bar = tk.Frame(win, bg=C_BG_PANEL); hint_bar.pack(fill=tk.X)
+    tk.Label(hint_bar,
+             text="  Выберите дату индексации и нужные значения. Фильтр по УСЛУГЕ обязателен.",
+             bg=C_BG_PANEL, fg=C_TEXT_HINT, font=FONT_SMALL).pack(anchor="w", padx=12, pady=6)
+    separator(win)
+    scroll_outer = tk.Frame(win, bg=C_BG); scroll_outer.pack(fill=tk.BOTH, expand=True)
+    _, sf = scroll_canvas(scroll_outer)
+
+    # Заголовок секции даты — красный, с пометкой "обязательно"
+    date_card = tk.LabelFrame(sf,
+                              text=" ⚠ Дата индексации — ОБЯЗАТЕЛЬНО выберите! ",
+                              bg=C_BG, fg="#C42B1C",
+                              font=("Segoe UI", 9, "bold"), relief="solid", bd=1)
+    date_card.pack(fill=tk.X, padx=12, pady=(10,4))
+    if RPT_COL_DATE in df_report.columns:
+        # Нормализуем даты к строкам перед сортировкой,
+        # т.к. колонка может содержать смешанные типы (Timestamp + str)
+        raw_dates = df_report[RPT_COL_DATE].dropna().unique()
+        # Сортировка от старых к новым (reverse=False)
+        udates = sorted(
+            set(norm_date(d) for d in raw_dates if norm_date(d)),
+            key=lambda d: pd.to_datetime(d, dayfirst=True, errors="coerce"),
+            reverse=False
+        )
+        date_var = tk.StringVar(value="(выберите дату)")
+        ttk.Combobox(date_card, textvariable=date_var,
+                     values=["(выберите дату)"] + list(udates),
+                     state="readonly", font=FONT_LABEL, width=28).pack(anchor="w", padx=12, pady=8)
+        tk.Label(date_card,
+                 text="Выберите дату индексации — без этого применить фильтры невозможно",
+                 bg=C_BG, fg="#C42B1C", font=FONT_SMALL).pack(anchor="w", padx=12, pady=(0,8))
+    else:
+        date_var = None
+        tk.Label(date_card, text=f"⚠ В отчёте нет колонки «{RPT_COL_DATE}»",
+                 bg=C_BG, fg="#C42B1C", font=FONT_LABEL).pack(padx=12, pady=8)
+
+    # ── Вычисляем канонические РФ текущего МРФ для авто-преселекта ──
+    # Берём список РФ из MRF_TO_RF и нормализуем через map_rf
+    mrf_rf_canonical = set()
+    if mrf_name and mrf_name in MRF_TO_RF:
+        for rf_raw in MRF_TO_RF[mrf_name]:
+            mrf_rf_canonical.add(norm_text(map_rf(rf_raw)))
+
+    # Нормализованное имя текущего МРФ для авто-преселекта
+    mrf_norm = norm_text(mrf_name) if mrf_name else ""
+
+    def make_values(col):
+        """Возвращает список значений для колонки в нормализованном виде."""
+        s = df_report[col].dropna()
+        if col == RPT_COL_RF:
+            # РФ: полное официальное название через unmap_rf, только РФ текущего МРФ
+            all_vals = sorted(dict.fromkeys(
+                unmap_rf(map_rf(x)) for x in s if str(x).strip()
+            ))
+            if mrf_rf_canonical:
+                # Фильтруем по каноническим ключам МРФ
+                filtered = [v for v in all_vals
+                            if norm_text(map_rf(v)) in mrf_rf_canonical]
+                return filtered if filtered else all_vals
+            return all_vals
+        elif col == RPT_COL_MRF:
+            # МРФ: эталонное написание, по алфавиту
+            return sorted(dict.fromkeys(
+                fmt_mrf(v) for v in s if str(v).strip()
+            ))
+        elif col == RPT_COL_SERVICE:
+            # Услуга: нормализованное написание через fmt_service
+            return sorted(dict.fromkeys(
+                fmt_service(str(v).strip()) for v in s if str(v).strip()
+            ))
+        elif col in (RPT_COL_SEGMENT, RPT_COL_SUBSEG):
+            # Сегмент/Подсегмент: fmt_seg, по алфавиту
+            return sorted(dict.fromkeys(
+                fmt_seg(norm_text(v)) for v in s if str(v).strip()
+            ))
+        else:
+            vals = [norm_text(v) for v in s]
+            return sorted(dict.fromkeys([v for v in vals if v]))
+
+    def auto_check(col, val):
+        """Нужно ли автоматически поставить галочку для этого значения?"""
+        if col == RPT_COL_RF:
+            # val — полное название вида "Екатеринбургский филиал" (после unmap_rf)
+            # нормализуем через map_rf чтобы сравнить с mrf_rf_canonical
+            return norm_text(map_rf(val)) in mrf_rf_canonical
+        if col == RPT_COL_MRF:
+            # Сравниваем через fmt_mrf т.к. значения теперь в эталонном виде
+            return fmt_mrf(val).lower() == mrf_norm or val == fmt_mrf(mrf_name)
+        return False
+
+    checkbox_vars = {}
+    for col in cols:
+        dn = col.replace(".1", "")
+        is_service = (dn == "Услуга")
+        title_lbl = f"⚠  {dn}  —  выберите обязательно!" if is_service else f"  {dn}"
+        title_fg  = "#C42B1C" if is_service else C_ACCENT
+        card = tk.LabelFrame(sf, text=title_lbl, bg=C_BG, fg=title_fg,
+                             font=("Segoe UI", 9, "bold"), relief="solid", bd=1)
+        card.pack(fill=tk.X, padx=12, pady=4)
+        btn_row = tk.Frame(card, bg=C_BG); btn_row.pack(fill=tk.X, padx=8, pady=(6,2))
+        values = make_values(col)
+        checkbox_vars[col] = {}
+        def _sel(c=col):
+            for v in checkbox_vars[c].values(): v.set(True)
+        def _des(c=col):
+            for v in checkbox_vars[c].values(): v.set(False)
+        flat_button(btn_row, "✓ Выбрать все", _sel, style="Secondary.TButton", width=14).pack(side=tk.LEFT, padx=(0,4))
+        flat_button(btn_row, "✗ Снять все",   _des, style="Secondary.TButton", width=14).pack(side=tk.LEFT)
+
+        # Подсказка об авто-преселекте для РФ и МРФ
+        if col == RPT_COL_RF and mrf_rf_canonical:
+            tk.Label(card,
+                     text=f"  ✅ Автоматически выбраны РФ МРФ {mrf_name}",
+                     bg=C_BG, fg="#107C10", font=FONT_SMALL).pack(anchor="w", padx=8, pady=(0,2))
+        if col == RPT_COL_MRF and mrf_norm:
+            tk.Label(card,
+                     text=f"  ✅ Автоматически выбран МРФ {mrf_name}",
+                     bg=C_BG, fg="#107C10", font=FONT_SMALL).pack(anchor="w", padx=8, pady=(0,2))
+
+        if len(values) > 12:
+            inner_cv = tk.Canvas(card, height=160, bg=C_BG, highlightthickness=0)
+            inner_sb = ttk.Scrollbar(card, orient="vertical", command=inner_cv.yview)
+            inner_fr = tk.Frame(inner_cv, bg=C_BG)
+            inner_fr.bind("<Configure>", lambda e, c=inner_cv: c.configure(scrollregion=c.bbox("all")))
+            inner_cv.create_window((0,0), window=inner_fr, anchor="nw")
+            inner_cv.configure(yscrollcommand=inner_sb.set)
+            inner_cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=6)
+            inner_sb.pack(side=tk.RIGHT, fill=tk.Y, pady=6)
+            container = inner_fr
+        else:
+            container = tk.Frame(card, bg=C_BG)
+            container.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
+        max_c = 3; rpc = max(1, (len(values) + max_c - 1) // max_c)
+        for idx, val in enumerate(values):
+            r, cn = idx % rpc, idx // rpc
+            # Авто-галочка для РФ и МРФ текущего МРФ
+            default_checked = auto_check(col, val)
+            var = tk.BooleanVar(value=default_checked)
+            checkbox_vars[col][val] = var
+            tk.Checkbutton(container, text=val, variable=var,
+                           bg=C_BG, fg=C_TEXT, activebackground=C_BG,
+                           activeforeground=C_ACCENT, selectcolor=C_BG,
+                           font=FONT_LABEL, relief="flat", bd=0,
+                           anchor="w", cursor="hand2", width=32).grid(row=r, column=cn, sticky="w", padx=6, pady=2)
+        for cn in range(max_c): container.columnconfigure(cn, weight=1)
+
+    separator(win)
+    act_row = tk.Frame(win, bg=C_BG); act_row.pack(fill=tk.X, padx=16, pady=10)
+    def on_apply():
+        if date_var is None or date_var.get() == "(выберите дату)":
+            messagebox.showwarning("Внимание", "Выберите дату индексации!", parent=win); return
+        svc_col = RPT_COL_SERVICE if RPT_COL_SERVICE in checkbox_vars else None
+        if svc_col and not any(v.get() for v in checkbox_vars[svc_col].values()):
+            messagebox.showwarning("Внимание",
+                "Выберите хотя бы одну УСЛУГУ!\nБез фильтра данные запишутся во все строки.",
+                parent=win); return
+        selected = {}
+        for c in cols:
+            vals = [val for val, v in checkbox_vars[c].items() if v.get()]
+            if c == RPT_COL_MRF:
+                # fmt_mrf → norm_text для сравнения с report_dict
+                vals = [norm_text(v) for v in vals]
+            elif c == RPT_COL_RF:
+                # unmap_rf → map_rf → norm_text для сравнения с report_dict
+                vals = [norm_text(map_rf(v)) for v in vals]
+            elif c == RPT_COL_SERVICE:
+                # fmt_service → norm_text для сравнения с report_dict
+                vals = [norm_text(v) for v in vals]
+            elif c in (RPT_COL_SEGMENT, RPT_COL_SUBSEG):
+                # fmt_seg → norm_text для сравнения с report_dict
+                vals = [norm_text(v) for v in vals]
+            selected[c] = vals
+        result["selected"] = {k: v for k, v in selected.items() if v}
+        result["date"] = date_var.get()
+        win.destroy()
+    def on_clear():
+        for col in cols:
+            for v in checkbox_vars[col].values(): v.set(False)
+        if date_var: date_var.set("(выберите дату)")
+    flat_button(act_row, "Применить фильтры →", on_apply, width=20).pack(side=tk.LEFT)
+    flat_button(act_row, "Сбросить всё", on_clear, style="Secondary.TButton", width=14).pack(side=tk.LEFT, padx=10)
+    flat_button(act_row, "Отмена", win.destroy, style="Danger.TButton", width=10).pack(side=tk.LEFT)
+    _get_file_root().wait_window(win); return result
+
+# ══════════════════════════════════════════════════════════════
+#  РАСЧЁТ ЭФФЕКТА
+#  Два режима — возвращают одинаковый pivot DataFrame
+# ══════════════════════════════════════════════════════════════
+
+def calc_pivot_external(df_base: pd.DataFrame, df_amount: pd.DataFrame,
+                        base_col: str, id_col: str,
+                        amount_col: str, group_cols: list[str]) -> pd.DataFrame:
+    """
+    РЕЖИМ A: начисления в отдельном файле.
+    Джоин по MSISDN, эффект = amount_col - base_col.
+    """
+    df_base   = df_base.copy()
+    df_amount = df_amount.copy()
+
+    df_base[base_col]     = pd.to_numeric(df_base[base_col],     errors='coerce')
+    df_amount[amount_col] = pd.to_numeric(df_amount[amount_col], errors='coerce')
+    df_base[id_col]       = df_base[id_col].astype(str).str.strip().str.replace('.0', '', regex=False)
+    df_amount["MSISDN"]   = df_amount["MSISDN"].astype(str).str.strip().str.replace('.0', '', regex=False)
+
+    print("   ⏳ Соединение баз данных по MSISDN, пожалуйста подождите...")
+    t = datetime.now()
+    merged = df_base.merge(df_amount[["MSISDN", amount_col]],
+                           left_on=id_col, right_on="MSISDN", how='left')
+    print(f"   ✓ Соединено: {len(merged):,} строк ({(datetime.now()-t).total_seconds():.1f} сек)")
+
+    merged['Эффект_руб'] = merged[amount_col] - merged[base_col]
+    merged.loc[merged['Эффект_руб'] < 0, 'Эффект_руб'] = 0
+    print(f"   ✓ С положительным эффектом: {(merged['Эффект_руб'] > 0).sum():,}")
+
+    print("   ⏳ Группировка данных...")
+    # Доп. колонки которые хотим сохранить в pivot (берём первое значение группы)
+    extra_cols = [c for c in [BASE_COL_PCT, BASE_COL_SEGMENT1]
+                  if c in merged.columns]
+    agg_dict = {'Эффект_руб': 'sum'}
+    for c in extra_cols:
+        agg_dict[c] = 'first'
+    pivot = merged.groupby(group_cols, as_index=False).agg(agg_dict)
+    pivot['Эффект_тыс'] = (pivot['Эффект_руб'] / 1000).round(3)
+    return pivot
+
+
+def calc_pivot_inbase(df_base: pd.DataFrame, base_col: str,
+                      current_col: str, group_cols: list[str]) -> pd.DataFrame:
+    """
+    РЕЖИМ B: начисления в той же базе.
+    Эффект = current_col - base_col, без джоина.
+    """
+    df = df_base.copy()
+    df[base_col]    = pd.to_numeric(df[base_col],    errors='coerce')
+    df[current_col] = pd.to_numeric(df[current_col], errors='coerce')
+
+    print("   ⏳ Расчёт эффекта из колонок базы...")
+    df['Эффект_руб'] = df[current_col] - df[base_col]
+    df.loc[df['Эффект_руб'] < 0, 'Эффект_руб'] = 0
+    print(f"   ✓ Строк в базе: {len(df):,}")
+    print(f"   ✓ С положительным эффектом: {(df['Эффект_руб'] > 0).sum():,}")
+
+    print("   ⏳ Группировка данных...")
+    extra_cols = [c for c in [BASE_COL_PCT, BASE_COL_SEGMENT1]
+                  if c in df.columns]
+    agg_dict = {'Эффект_руб': 'sum'}
+    for c in extra_cols:
+        agg_dict[c] = 'first'
+    pivot = df.groupby(group_cols, as_index=False).agg(agg_dict)
+    pivot['Эффект_тыс'] = (pivot['Эффект_руб'] / 1000).round(3)
+    return pivot
+
+# ══════════════════════════════════════════════════════════════
+#  ОБРАБОТКА ОДНОЙ БАЗЫ
+# ══════════════════════════════════════════════════════════════
+
 def process_one_base(df_base: pd.DataFrame,
                      df_amount: Optional[pd.DataFrame],
                      df_report,
@@ -563,3 +1562,520 @@ def process_one_base(df_base: pd.DataFrame,
     print(f"   ⏱ Сопоставление заняло: {match_sec:.1f} сек")
     return updated_count, added_count, matched_indices, added_indices, \
            not_found_indices, pivot['Эффект_тыс'].sum(), df_report
+
+
+def _build_new_row(df_report: pd.DataFrame, pivot_row: pd.Series,
+                   svc_val: str, selected_date: str, target_col: str,
+                   eff_value: float,
+                   pct_lookup: Optional[dict] = None) -> dict:
+    """Строит словарь новой строки с нормализованными форматами.
+    pct_lookup: dict (мрф_norm, рф_norm) → процент индексации из отчёта.
+    """
+    new_row = {col: None for col in df_report.columns}
+
+    # Услуга — UPPERCASE для спецуслуг, иначе первое с заглавной
+    if RPT_COL_SERVICE in new_row:
+        new_row[RPT_COL_SERVICE] = fmt_service(svc_val)
+
+    # Дата — datetime-объект (openpyxl запишет как дату, формат DD.MM.YYYY зададим при сохранении)
+    if RPT_COL_DATE in new_row:
+        try:
+            new_row[RPT_COL_DATE] = pd.to_datetime(selected_date, dayfirst=True).date()
+        except (ValueError, TypeError, OverflowError):
+            new_row[RPT_COL_DATE] = selected_date
+
+    # % индексации:
+    # 1) Сначала берём из отчёта (pct_lookup) — по ключу МРФ+РФ из выборки
+    # 2) Если не нашли — берём из базы индексации
+    if RPT_COL_PCT in new_row:
+        pct_val = None
+        if pct_lookup:
+            mrf_key = norm_text(pivot_row[BASE_COL_MRF]) if BASE_COL_MRF in pivot_row.index else ""
+            rf_key  = map_rf(pivot_row[BASE_COL_RF])     if BASE_COL_RF  in pivot_row.index else ""
+            pct_val = pct_lookup.get((mrf_key, rf_key))
+        if pct_val is None and BASE_COL_PCT in pivot_row.index:
+            pct_val = fmt_pct(pivot_row[BASE_COL_PCT])
+        if pct_val is not None:
+            new_row[RPT_COL_PCT] = pct_val
+
+    # МРФ — нормализованное написание через словарь
+    if RPT_COL_MRF in new_row and BASE_COL_MRF in pivot_row.index:
+        new_row[RPT_COL_MRF] = fmt_mrf(pivot_row[BASE_COL_MRF])
+
+    # РФ — полное официальное название через обратный маппинг
+    # Напр: 'ФЭС Тюменский' → 'Филиал в Тюменской и Курганской областях'
+    if RPT_COL_RF in new_row and BASE_COL_RF in pivot_row.index:
+        new_row[RPT_COL_RF] = unmap_rf(map_rf(pivot_row[BASE_COL_RF]))
+
+    # Краткий Сегмент — UPPERCASE
+    if RPT_COL_SEGMENT in new_row and BASE_COL_SEGMENT in pivot_row.index:
+        new_row[RPT_COL_SEGMENT] = fmt_seg(pivot_row[BASE_COL_SEGMENT])
+
+    # Сегмент1 из базы → Сегмент в отчёте
+    if RPT_COL_SEGMENT1 in new_row and BASE_COL_SEGMENT1 in pivot_row.index:
+        new_row[RPT_COL_SEGMENT1] = fmt_seg(pivot_row[BASE_COL_SEGMENT1])
+
+    # Подсегмент — UPPERCASE
+    if RPT_COL_SUBSEG in new_row and BASE_COL_SUBSEG in pivot_row.index:
+        new_row[RPT_COL_SUBSEG] = fmt_seg(pivot_row[BASE_COL_SUBSEG])
+
+    # Эффект — число с 3 знаками
+    if target_col in new_row:
+        new_row[target_col] = fmt_num3(eff_value)
+
+    return new_row
+
+# ══════════════════════════════════════════════════════════════
+#  СОХРАНЕНИЕ
+# ══════════════════════════════════════════════════════════════
+
+def save_report(df_report: pd.DataFrame, target_col: str,
+                matched_indices: list[int], added_indices: list[int],
+                not_found_indices: list[int],
+                table3_path: str, month: str) -> tuple[str, pd.DataFrame]:
+    if ask_yes_no("Сохранение", "Сохранить изменения в том же файле?"):
+        save_path = table3_path
+    else:
+        default = f"отчет_эффект_{month}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        save_path = select_save_file("Сохранить отчёт как", default)
+        if not save_path:
+            print("  Сохранение отменено."); return table3_path, df_report
+    try:
+        _wait_save = WaitingWindow("⏳ Идёт сохранение...",
+                                   "Файл сохраняется, пожалуйста, подождите.")
+        t = datetime.now()
+
+        print("  ⏳ Нормализация данных...")
+        # ── Нормализуем значения колонок перед сохранением ───────────────────
+        # Применяется ко ВСЕМ строкам, включая уже существующие в отчёте
+        # Поиск колонок нечувствителен к регистру
+
+        # Используем глобальную find_col_name (нечувствительна к регистру)
+        real_svc  = find_col_name(df_report, RPT_COL_SERVICE)
+        real_mrf  = find_col_name(df_report, RPT_COL_MRF)
+        real_rf   = find_col_name(df_report, RPT_COL_RF)
+        real_date = find_col_name(df_report, RPT_COL_DATE)
+        real_pct  = find_col_name(df_report, RPT_COL_PCT)
+
+        print(f"   Колонки отчёта: Услуга={real_svc!r}, МРФ={real_mrf!r}, РФ={real_rf!r}")
+
+        # Услуга — UPPERCASE для спецуслуг, иначе первое с заглавной
+        if real_svc:
+            df_report[real_svc] = df_report[real_svc].apply(
+                lambda x: fmt_service(x) if pd.notna(x) and str(x).strip() != "" else x)
+
+        # МРФ — нормализованное написание через словарь
+        if real_mrf:
+            df_report[real_mrf] = df_report[real_mrf].apply(
+                lambda x: fmt_mrf(x) if pd.notna(x) and str(x).strip() != "" else x)
+
+        # РФ — первое слово с заглавной
+        if real_rf:
+            df_report[real_rf] = df_report[real_rf].apply(
+                lambda x: fmt_title(x) if pd.notna(x) and str(x).strip() != "" else x)
+
+        real_seg  = find_col_name(df_report, RPT_COL_SEGMENT)
+        real_sub  = find_col_name(df_report, RPT_COL_SUBSEG)
+        real_tgt  = find_col_name(df_report, target_col)
+
+        print(f"   Колонки отчёта: Сегмент={real_seg!r}, Подсегмент={real_sub!r}")
+
+        # Краткий Сегмент — UPPERCASE
+        if real_seg:
+            df_report[real_seg] = df_report[real_seg].apply(
+                lambda x: fmt_seg(x) if pd.notna(x) and str(x).strip() != "" else x)
+
+        # Подсегмент — UPPERCASE
+        if real_sub:
+            df_report[real_sub] = df_report[real_sub].apply(
+                lambda x: fmt_seg(x) if pd.notna(x) and str(x).strip() != "" else x)
+
+        # Сегмент (из Сегмент1) — UPPERCASE
+        real_seg1 = find_col_name(df_report, RPT_COL_SEGMENT1)
+        if real_seg1:
+            df_report[real_seg1] = df_report[real_seg1].apply(
+                lambda x: fmt_seg(x) if pd.notna(x) and str(x).strip() != "" else x)
+
+        # Дата индексации — приводим к datetime.date для корректного отображения DD.MM.YYYY
+        if real_date:
+            df_report[real_date] = df_report[real_date].apply(
+                lambda x: pd.to_datetime(x, dayfirst=True, errors="coerce").date()
+                          if pd.notna(x) and str(x).strip() != "" else x)
+
+        # Процент индексации — число 0..1
+        if real_pct:
+            df_report[real_pct] = df_report[real_pct].apply(
+                lambda x: fmt_pct(x) if pd.notna(x) and str(x).strip() != "" else x)
+
+        # Эффект — число с 3 знаками
+        if real_tgt:
+            df_report[real_tgt] = df_report[real_tgt].apply(
+                lambda x: fmt_num3(x) if pd.notna(x) and str(x).strip() != "" else x)
+
+        print("  ⏳ Запись данных в Excel файл...")
+        with pd.ExcelWriter(save_path, engine='openpyxl', mode='w') as writer:
+            df_report.to_excel(writer, sheet_name=SHEET_TABLE3, index=False)
+        print("  ⏳ Применяем форматы ячеек и заливку...")
+        wb  = load_workbook(save_path); ws = wb[SHEET_TABLE3]
+        grn  = PatternFill(start_color=FILL_UPDATED,   end_color=FILL_UPDATED,   fill_type='solid')
+        blue = PatternFill(start_color=FILL_ADDED,     end_color=FILL_ADDED,     fill_type='solid')
+        yel  = PatternFill(start_color=FILL_NOT_FOUND, end_color=FILL_NOT_FOUND, fill_type='solid')
+
+        # ── Определяем номера колонок по именам ──────────────────────────────
+        cols_list = list(df_report.columns)
+        def col_idx(name):
+            return cols_list.index(name) + 1 if name in cols_list else None
+
+        ci_target  = col_idx(target_col)
+        ci_service = col_idx(RPT_COL_SERVICE)
+        ci_date    = col_idx(RPT_COL_DATE)
+        ci_pct     = col_idx(RPT_COL_PCT)
+        ci_mrf     = col_idx(RPT_COL_MRF)
+        ci_rf      = col_idx(RPT_COL_RF)
+        ci_seg     = col_idx(RPT_COL_SEGMENT)
+        ci_sub     = col_idx(RPT_COL_SUBSEG)
+
+        # ── Форматы ──────────────────────────────────────────────────────────
+        FMT_DATE   = "DD.MM.YYYY"
+        FMT_PCT    = "0.00%"
+        FMT_NUM3   = "#,##0.000"
+        FMT_TEXT   = "@"          # текстовый формат
+
+        # Применяем форматы ко ВСЕМ строкам данных (начиная со 2-й, т.к. 1-я — заголовок)
+        max_row = ws.max_row
+        for row_num in range(2, max_row + 1):
+            if ci_service: ws.cell(row=row_num, column=ci_service).number_format = FMT_TEXT
+            if ci_date:    ws.cell(row=row_num, column=ci_date).number_format    = FMT_DATE
+            if ci_pct:     ws.cell(row=row_num, column=ci_pct).number_format     = FMT_PCT
+            if ci_mrf:     ws.cell(row=row_num, column=ci_mrf).number_format     = FMT_TEXT
+            if ci_rf:      ws.cell(row=row_num, column=ci_rf).number_format      = FMT_TEXT
+            if ci_seg:     ws.cell(row=row_num, column=ci_seg).number_format     = FMT_TEXT
+            if ci_sub:     ws.cell(row=row_num, column=ci_sub).number_format     = FMT_TEXT
+            if ci_target:  ws.cell(row=row_num, column=ci_target).number_format  = FMT_NUM3
+
+        # ── Цветовая заливка ─────────────────────────────────────────────────
+        ci = ci_target if ci_target else 1
+        for ridx in matched_indices:
+            ws.cell(row=ridx + 2, column=ci).fill = grn
+        for ridx in added_indices:
+            for c in range(1, len(cols_list) + 1):
+                ws.cell(row=ridx + 2, column=c).fill = blue
+        for ridx in not_found_indices:
+            ws.cell(row=ridx + 2, column=ci).fill = yel
+        wb.save(save_path)
+        _wait_save.close()
+        save_sec = (datetime.now() - t).total_seconds()
+        print(f"  ✓ Сохранено: {os.path.basename(save_path)} ({save_sec:.1f} сек)")
+        print(f"     🟢 Обновлено: {len(matched_indices)} ячеек")
+        print(f"     🔵 Добавлено: {len(added_indices)} строк")
+        if not_found_indices:
+            print(f"     🟡 Не найдено в базе: {len(not_found_indices)} строк")
+        return save_path, df_report
+    except Exception as e:
+        try: _wait_save.close()
+        except tk.TclError: pass
+        print(f"  ❌ Ошибка сохранения: {e}")
+        messagebox.showerror("Ошибка сохранения",
+            f"Не удалось сохранить файл:\n{e}",
+            parent=_get_file_root())
+        return table3_path, df_report
+
+# ══════════════════════════════════════════════════════════════
+#  ОБРАБОТКА ОДНОГО МРФ
+# ══════════════════════════════════════════════════════════════
+
+def process_mrf(mrf_name: str, df_report: pd.DataFrame, table3_path: str,
+                month: str, amount_col: str, target_col: str,
+                session_counts: dict) -> tuple:
+    """
+    session_counts — dict с накопленными счётчиками за сессию:
+      {"matched": int, "added": int, "not_found": int}
+    Индексы ячеек НЕ накапливаются глобально — только для текущего сохранения.
+    """
+    global _session_log   # журнал сессии доступен как глобальная переменная
+    print(f"\n{'#'*60}\n  МРФ: {mrf_name.upper()}\n{'#'*60}")
+    summary_lines = []
+
+    # ── Загрузка начислений (только для первой базы МРФ в РЕЖИМЕ A) ──
+    # Для каждой базы спрашиваем режим отдельно, поэтому начисления
+    # загружаем лениво — только если понадобятся.
+    df_amount_cache = None   # кэш: чтобы не грузить повторно если МРФ имеет несколько баз в MODE_A
+
+    base_num = 0; mrf_upd = 0; mrf_add = 0; mrf_eff = 0.0
+
+    while True:
+        base_num += 1
+        print(f"\n  Загрузите БАЗУ ИНДЕКСАЦИИ #{base_num} для МРФ {mrf_name}...")
+        base_path = select_file(f"БАЗА ИНДЕКСАЦИИ #{base_num} — МРФ {mrf_name}")
+        if not base_path:
+            print(f"  Файл не выбран — завершаем МРФ {mrf_name}."); break
+
+        base_name = os.path.basename(base_path)
+        _session_log.add(f"   📋 База #{base_num}", base_path)
+        print(f"  ⏳ Загружаем базу индексации, пожалуйста подождите...")
+        t = datetime.now()
+        try:
+            df_base = pd.read_excel(base_path, sheet_name=SHEET_TABLE2)
+        except (FileNotFoundError, ValueError, KeyError, Exception) as e:
+            print(f"  ❌ Ошибка загрузки базы: {e}")
+            if not ask_yes_no("Ошибка", f"Попробовать другую базу для МРФ {mrf_name}?"):
+                break
+            base_num -= 1; continue
+        print(f"  ✓ {len(df_base):,} строк ({(datetime.now()-t).total_seconds():.1f} сек)")
+
+        # ── Выбор режима источника начислений ──
+        charges_mode = ask_charges_mode(base_name, mrf_name)
+        if not charges_mode:
+            print("  Режим не выбран — пропускаем базу.")
+            if not ask_yes_no("Пропустить?", f"Загрузить следующую базу для {mrf_name}?"):
+                break
+            base_num -= 1; continue
+
+        print(f"  Режим: {'📂 внешний файл начислений' if charges_mode == MODE_EXTERNAL else '📊 начисления в базе'}")
+
+        # ── Колонка «до индексации» (нужна в обоих режимах) ──
+        base_col = select_column(df_base.columns,
+            f"МРФ {mrf_name} — база #{base_num}: начисление ДО индексации",
+            "Выберите колонку с НАЧИСЛЕНИЕМ ДО ИНДЕКСАЦИИ:")
+        if not base_col:
+            if not ask_yes_no("Пропустить?", f"Загрузить следующую базу для {mrf_name}?"):
+                break
+            base_num -= 1; continue
+
+        # ── Дополнительные параметры по режиму ──
+        id_col      = None
+        current_col = None
+        df_amount   = None
+
+        if charges_mode == MODE_EXTERNAL:
+            # Идентификатор абонента
+            possible_ids = ["MSISDN",
+                            "Уникальный идентификационный номер услуги (ШПД, VPN - логин порта)",
+                            "Уникальный идентификационный номер услуги",
+                            "MSISDN/Логин"]
+            id_col = next((c for c in possible_ids if c in df_base.columns), None)
+            if not id_col:
+                id_col = select_column(df_base.columns,
+                    f"МРФ {mrf_name}: идентификатор абонента",
+                    "Выберите колонку с УНИКАЛЬНЫМ ИДЕНТИФИКАТОРОМ (MSISDN/логин):")
+                if not id_col:
+                    if not ask_yes_no("Пропустить?", f"Загрузить следующую базу для {mrf_name}?"):
+                        break
+                    base_num -= 1; continue
+
+            # Файл начислений — используем кэш если уже загружен
+            if df_amount_cache is None:
+                print(f"\n  Загрузите файл НАЧИСЛЕНИЙ для МРФ {mrf_name}...")
+                charges_path = select_file(f"НАЧИСЛЕНИЯ — МРФ {mrf_name}")
+                if not charges_path:
+                    print("  Файл не выбран — пропускаем базу.")
+                    if not ask_yes_no("Пропустить?", f"Загрузить следующую базу для {mrf_name}?"):
+                        break
+                    base_num -= 1; continue
+                print(f"  ⏳ Загрузка начислений [{mrf_name}]... (может занять несколько минут)")
+                t = datetime.now()
+                try:
+                    df_amount_cache = pd.read_excel(charges_path, sheet_name=SHEET_TABLE1)
+                except (FileNotFoundError, ValueError, KeyError, Exception) as e:
+                    print(f"  ❌ Ошибка загрузки начислений: {e}")
+                    if not ask_yes_no("Пропустить?", f"Загрузить следующую базу для {mrf_name}?"):
+                        break
+                    base_num -= 1; continue
+                print(f"  ✓ {len(df_amount_cache):,} строк ({(datetime.now()-t).total_seconds():.1f} сек)")
+                _session_log.add("   💰 Начисления", charges_path)
+                if amount_col not in df_amount_cache.columns:
+                    print(f"  ❌ Нет колонки '{amount_col}' в файле начислений")
+                    df_amount_cache = None
+                    if not ask_yes_no("Пропустить?", f"Загрузить следующую базу для {mrf_name}?"):
+                        break
+                    base_num -= 1; continue
+                if "MSISDN" not in df_amount_cache.columns:
+                    print("  ❌ Нет колонки 'MSISDN' в файле начислений")
+                    df_amount_cache = None
+                    if not ask_yes_no("Пропустить?", f"Загрузить следующую базу для {mrf_name}?"):
+                        break
+                    base_num -= 1; continue
+            if df_amount_cache is None:
+                print("  ❌ Файл начислений не загружен — пропускаем базу.")
+                base_num -= 1; continue
+            df_amount = df_amount_cache
+
+        else:  # MODE_INBASE
+            # Колонка с текущим начислением прямо в базе
+            current_col = select_column(df_base.columns,
+                f"МРФ {mrf_name} — база #{base_num}: ТЕКУЩЕЕ начисление (после индексации)",
+                "Выберите колонку с ТЕКУЩИМ (фактическим) НАЧИСЛЕНИЕМ в этой базе:")
+            if not current_col:
+                if not ask_yes_no("Пропустить?", f"Загрузить следующую базу для {mrf_name}?"):
+                    break
+                base_num -= 1; continue
+
+        gcols = [c for c in [BASE_COL_MRF, BASE_COL_RF, BASE_COL_SEGMENT, BASE_COL_SUBSEG, BASE_COL_SEGMENT1]
+                 if c in df_base.columns]
+        if not gcols:
+            print("  ❌ Нет колонок группировки.")
+            if not ask_yes_no("Пропустить?", f"Загрузить следующую базу для {mrf_name}?"):
+                break
+            base_num -= 1; continue
+
+        # Логируем выбранные колонки в журнал сессии
+        if base_col:
+            _session_log.add_text(f"   📊 Колонка ДО: {base_col}")
+        if charges_mode == MODE_INBASE and current_col:
+            _session_log.add_text(f"   📊 Колонка ТЕКУЩЕЕ: {current_col}")
+
+        res = process_one_base(
+            df_base, df_amount, df_report,
+            base_col, id_col, amount_col, current_col,
+            charges_mode, gcols, target_col,
+            base_name, mrf_name, base_num)
+
+        if res:
+            upd, add, m_idx, a_idx, nf_idx, eff, df_report = res
+            # Накапливаем только счётчики — индексы не храним глобально
+            session_counts["matched"]   += upd
+            session_counts["added"]     += add
+            session_counts["not_found"] += len(nf_idx)
+            mrf_upd += upd; mrf_add += add; mrf_eff += eff
+            # Для сохранения используем ТОЛЬКО индексы текущей базы
+            cur_matched   = m_idx
+            cur_added     = a_idx
+            cur_not_found = nf_idx
+            mode_str = "📂 внешние начисления" if charges_mode == MODE_EXTERNAL else "📊 начисления из базы"
+            summary_lines.append(
+                f"    База #{base_num} ({base_name}) [{mode_str}]:\n"
+                f"      Записано строк:  {upd}\n"
+                f"      Добавлено строк: {add}\n"
+                f"      Эффект:          {eff:,.3f} тыс. руб.")
+            # Передаём только индексы ТЕКУЩЕЙ базы — не накопленные
+            table3_path, df_report = save_report(
+                df_report, target_col,
+                cur_matched, cur_added,
+                cur_not_found, table3_path, month)
+            # После сохранения освобождаем память
+            del cur_matched, cur_added, cur_not_found
+        else:
+            summary_lines.append(f"    База #{base_num} ({base_name}): пропущена")
+
+        if not ask_yes_no("Ещё одна база?",
+                          f"МРФ {mrf_name}, база #{base_num} обработана.\n"
+                          f"Загрузить ещё одну базу для МРФ {mrf_name}?"):
+            break
+
+    return table3_path, df_report, (
+        [f"\n  МРФ {mrf_name}:"] + summary_lines +
+        [f"    ИТОГО: обновлено {mrf_upd} стр., добавлено {mrf_add} стр., "
+         f"эффект {mrf_eff:,.3f} тыс. руб."]
+    )
+
+# ══════════════════════════════════════════════════════════════
+#  ГЛАВНАЯ ФУНКЦИЯ
+# ══════════════════════════════════════════════════════════════
+
+def main():
+    t0 = datetime.now()
+    print("="*60)
+    print("РАСЧЁТ ФАКТИЧЕСКОГО ЭФФЕКТА ОТ ИНДЕКСАЦИИ")
+    print("="*60)
+
+    # Инициализируем единственный Tk-root ДО любых диалогов
+    _get_file_root()
+    # Гарантируем закрытие журнала при любом завершении (в т.ч. при ошибке)
+    import atexit
+    atexit.register(lambda: _session_log.close())
+
+    month = select_month()
+    if not month: print("Выход."); return
+    print(f"\n1. Месяц: {month}")
+    amount_col = f"Без НДС {month}"
+
+    chosen_mrf = select_mrf_window()
+    if not chosen_mrf: print("Выход."); return
+    print(f"\n2. МРФ: {', '.join(chosen_mrf)}")
+
+    # Запускаем журнал сессии
+    _session_log.add_text(f"🗓  Месяц: {month}")
+    _session_log.add_text(f"🏢  МРФ:   {', '.join(chosen_mrf)}")
+    _session_log.add_text("─" * 55)
+    _session_log.show()
+
+    print("\n3. Загрузите ОБЩИЙ ОТЧЁТ...")
+    table3_path = select_file("Выберите файл отчёта (Таблица 3)")
+    if not table3_path: print("Выход."); return
+    _session_log.add("📊 Отчёт", table3_path)
+
+    print("⏳ Загружаем отчёт (Таблица 3), пожалуйста подождите...")
+    t = datetime.now()
+    try:
+        df_report = pd.read_excel(table3_path, sheet_name=SHEET_TABLE3)
+    except (FileNotFoundError, ValueError, KeyError, Exception) as e:
+        messagebox.showerror("Ошибка", f"Ошибка загрузки отчёта:\n{e}",
+            parent=_get_file_root())
+        return
+    print(f"   ✓ Отчёт: {len(df_report):,} строк ({(datetime.now()-t).total_seconds():.1f} сек)")
+
+    target_col = None
+    for col in df_report.columns:
+        cs = str(col).lower()
+        if month in cs and all(kw in cs for kw in TARGET_COL_KEYWORDS):
+            target_col = col; break
+
+    if not target_col:
+        print(f"❌ Нет целевой колонки для '{month}'")
+        print(f"   Колонка должна содержать: {TARGET_COL_KEYWORDS} и '{month}'")
+        for col in df_report.columns:
+            if month in str(col).lower():
+                print(f"     • {col}")
+        messagebox.showerror("Ошибка", f"Нет целевой колонки для '{month}'\n"
+            f"Колонка должна содержать: {TARGET_COL_KEYWORDS}",
+            parent=_get_file_root())
+        return
+    print(f"   Целевая колонка: {target_col}")
+
+    # Храним только счётчики — не списки индексов
+    # Это предотвращает рост памяти при 100+ базах
+    session_counts = {"matched": 0, "added": 0, "not_found": 0}
+    session_summary = []
+
+    for i, mrf_name in enumerate(chosen_mrf, 1):
+        print(f"\n{'='*60}\n  [{i}/{len(chosen_mrf)}] МРФ: {mrf_name.upper()}\n{'='*60}")
+        table3_path, df_report, mrf_sum = process_mrf(
+            mrf_name, df_report, table3_path, month,
+            amount_col, target_col, session_counts)
+        session_summary.extend(mrf_sum)
+
+        if i < len(chosen_mrf):
+            if not ask_yes_no("Следующий МРФ",
+                              f"МРФ {mrf_name} обработан.\nПерейти к МРФ {chosen_mrf[i]}?"):
+                session_summary.append(f"\n  ⚠️ Остановлено на МРФ {mrf_name}.")
+                break
+
+    total_time = (datetime.now()-t0).total_seconds()
+    sep = "=" * 60
+    print(f"\n{sep}\nИТОГ\n{sep}")
+    for line in session_summary: print(line)
+    print(f"\n  🟢 Записано/перезаписано строк: {session_counts['matched']}")
+    print(f"  🔵 Добавлено новых строк: {session_counts['added']}")
+    if session_counts["not_found"]:
+        print(f"  🟡 Не найдено в базе: {session_counts['not_found']} строк")
+    print(f"  Время: {total_time:.0f} сек ({total_time/60:.1f} мин)")
+
+    not_found_line = (f"\n🟡 Не найдено в базе: {session_counts['not_found']} строк"
+                     if session_counts["not_found"] else "")
+    _session_log.close()
+    show_progress(
+        f"Расчёт за {month} 2026 завершён!\n"
+        f"МРФ: {', '.join(chosen_mrf)}\n\n"
+        + "\n".join(session_summary)
+        + f"\n\n🟢 Записано строк: {session_counts['matched']}"
+          f"\n🔵 Добавлено новых строк: {session_counts['added']}"
+          + not_found_line +
+          f"\n(🟢 обновлено  🔵 добавлено  🟡 не найдено в базе)\n\n"
+          f"Общее время: {total_time/60:.1f} мин",
+        title="Итог расчёта"
+    )
+
+
+
+if __name__ == "__main__":
+    main()
