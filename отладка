@@ -1,0 +1,85 @@
+# ══════════════════════════════════════════════════════════════
+#  🐞 ДЕТАЛЬНАЯ ОТЛАДКА для ЧЕЛЯБИНСКОГО ФИЛИАЛА / ТОП
+# ══════════════════════════════════════════════════════════════
+# Определяем, обрабатывается ли сейчас целевая комбинация
+is_chelyabinsk_top = False
+# Проверяем, есть ли в pivot данные по Челябинскому филиалу
+# (используем нормализованные названия)
+chelyabinsk_rf_norm = norm_text(unmap_rf("Челябинский"))  # Получаем каноническое название
+for _, pr in pivot.iterrows():
+    rf_val = map_rf(pr[BASE_COL_RF]) if BASE_COL_RF in pr.index else ""
+    seg_val = norm_text(pr[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in pr.index else ""
+    if rf_val == chelyabinsk_rf_norm and seg_val == "топ":
+        is_chelyabinsk_top = True
+        break
+
+if is_chelyabinsk_top:
+    print("\n" + "="*70)
+    print("🐞 ДЕТАЛЬНАЯ ОТЛАДКА для ЧЕЛЯБИНСКОГО ФИЛИАЛА / СЕГМЕНТ ТОП")
+    print("="*70)
+
+    # 1. Исходные данные из PIVOT (сгруппированные данные)
+    print("\n--- 1. ДАННЫЕ ИЗ PIVOT (после группировки) ---")
+    pivot_filtered = pivot[
+        (pivot[BASE_COL_RF].apply(lambda x: map_rf(x) == chelyabinsk_rf_norm)) &
+        (pivot[BASE_COL_SEGMENT].apply(lambda x: norm_text(x) == "топ"))
+    ]
+    print(f"   Найдено групп: {len(pivot_filtered)}")
+    print(pivot_filtered[[BASE_COL_SERVICE, BASE_COL_MRF, BASE_COL_RF,
+                          BASE_COL_SEGMENT, BASE_COL_SUBSEG, 'Эффект_тыс']].to_string(index=False))
+
+    # 2. Фильтры, применённые в окне
+    print("\n--- 2. АКТИВНЫЕ ФИЛЬТРЫ ИЗ ОКНА ---")
+    for fc, fv in selected_segments.items():
+        print(f"   {fc}: {fv[:3]}{'...' if len(fv) > 3 else ''}")  # Показываем первые 3 значения для краткости
+    print(f"   Выбранная дата: {selected_date}")
+
+    # 3. Данные из ОТЧЁТА, соответствующие этим фильтрам
+    print("\n--- 3. СТРОКИ В ОТЧЁТЕ ПО ДАТЕ И УСЛУГАМ (из report_dict) ---")
+    matching_keys = []
+    for key, idxs in report_dict.items():
+        svc, mrf, rf, seg, sub = key
+        if rf == chelyabinsk_rf_norm and seg == "топ":
+            matching_keys.append((svc, mrf, rf, seg, sub, idxs))
+    print(f"   Найдено строк в отчёте: {len(matching_keys)}")
+    for svc, mrf, rf, seg, sub, idxs in matching_keys[:5]:  # Показываем первые 5
+        print(f"   - Услуга='{svc}', МРФ='{mrf}', РФ='{rf}', Сег='{seg}', Под='{sub}', Индексы: {idxs[:3]}...")
+
+    # 4. Пошаговый расчёт ИТОГОВОЙ ЦИФРЫ для отчёта
+    print("\n--- 4. ПОШАГОВЫЙ РАСЧЁТ ИТОГОВОЙ ЦИФРЫ ДЛЯ ОТЧЁТА ---")
+    # Суммируем эффект по всем группам Челябинск/ТОП из PIVOT
+    total_effect_pivot = pivot_filtered['Эффект_тыс'].sum()
+    print(f"   Шаг 1: Сумма 'Эффект_тыс' по всем группам Челябинск/ТОП в PIVOT = {total_effect_pivot:.3f} тыс. руб.")
+
+    # Смотрим, сколько из этих групп уже есть в отчёте (будут обновлены)
+    existing_in_report = 0
+    effect_written_to_report = 0.0
+    for _, pr in pivot_filtered.iterrows():
+        svc = pr[BASE_COL_SERVICE] if BASE_COL_SERVICE in pr.index else ""
+        mrf = norm_text(pr[BASE_COL_MRF]) if BASE_COL_MRF in pr.index else ""
+        rf = map_rf(pr[BASE_COL_RF]) if BASE_COL_RF in pr.index else ""
+        seg = norm_text(pr[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in pr.index else ""
+        sub = norm_text(pr[BASE_COL_SUBSEG]) if BASE_COL_SUBSEG in pr.index else ""
+        key = (norm_text(svc), mrf, rf, seg, sub)
+        if key in report_dict:
+            existing_in_report += 1
+            effect_written_to_report += pr['Эффект_тыс']
+        else:
+            # Проверяем, есть ли строка с такой же комбинацией МРФ+РФ+Сег+Под (без учёта услуги)
+            key_no_svc = (mrf, rf, seg, sub)
+            for k_full in report_dict:
+                if (k_full[1], k_full[2], k_full[3], k_full[4]) == key_no_svc:
+                    existing_in_report += 1
+                    effect_written_to_report += pr['Эффект_тыс']
+                    break
+    print(f"   Шаг 2: Из них уже есть в отчёте (будут ОБНОВЛЕНЫ): {existing_in_report} групп")
+    print(f"          Сумма эффекта по этим группам: {effect_written_to_report:.3f} тыс. руб.")
+
+    # Сколько групп будет добавлено как новые строки
+    added_groups = len(pivot_filtered) - existing_in_report
+    print(f"   Шаг 3: Будет ДОБАВЛЕНО новых строк: {added_groups} групп")
+    print(f"          Сумма эффекта по добавляемым группам: {total_effect_pivot - effect_written_to_report:.3f} тыс. руб.")
+
+    # ИТОГОВАЯ ЦИФРА, которая попадёт в отчёт (сумма всех групп)
+    print(f"\n   ✅ ИТОГОВАЯ ЦИФРА для отчёта (сумма по Челябинск/ТОП): {total_effect_pivot:.3f} тыс. руб.")
+    print("="*70 + "\n")
