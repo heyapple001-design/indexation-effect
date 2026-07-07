@@ -1,85 +1,334 @@
-# ══════════════════════════════════════════════════════════════
-#  🐞 ДЕТАЛЬНАЯ ОТЛАДКА для ЧЕЛЯБИНСКОГО ФИЛИАЛА / ТОП
-# ══════════════════════════════════════════════════════════════
-# Определяем, обрабатывается ли сейчас целевая комбинация
-is_chelyabinsk_top = False
-# Проверяем, есть ли в pivot данные по Челябинскому филиалу
-# (используем нормализованные названия)
-chelyabinsk_rf_norm = norm_text(unmap_rf("Челябинский"))  # Получаем каноническое название
-for _, pr in pivot.iterrows():
-    rf_val = map_rf(pr[BASE_COL_RF]) if BASE_COL_RF in pr.index else ""
-    seg_val = norm_text(pr[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in pr.index else ""
-    if rf_val == chelyabinsk_rf_norm and seg_val == "топ":
-        is_chelyabinsk_top = True
-        break
+def process_one_base(df_base: pd.DataFrame,
+                     df_amount: Optional[pd.DataFrame],  # None при MODE_INBASE
+                     df_report,
+                     base_col,                    # колонка «до индексации»
+                     id_col,                      # None при MODE_INBASE
+                     amount_col,                  # колонка в файле начислений (MODE_A)
+                     current_col,                 # колонка «текущее» в базе (MODE_B)
+                     charges_mode,                # MODE_EXTERNAL или MODE_INBASE
+                     available_group_cols,
+                     target_col,
+                     base_name, mrf_name, iteration_num):
 
-if is_chelyabinsk_top:
-    print("\n" + "="*70)
-    print("🐞 ДЕТАЛЬНАЯ ОТЛАДКА для ЧЕЛЯБИНСКОГО ФИЛИАЛА / СЕГМЕНТ ТОП")
-    print("="*70)
+    print(f"\n  {'='*55}")
+    print(f"  БАЗА #{iteration_num} [{mrf_name}]: {base_name}")
+    mode_label = "📂 отдельный файл начислений" if charges_mode == MODE_EXTERNAL else "📊 начисления в базе"
+    print(f"  Режим: {mode_label}")
+    print(f"  {'='*55}")
 
-    # 1. Исходные данные из PIVOT (сгруппированные данные)
-    print("\n--- 1. ДАННЫЕ ИЗ PIVOT (после группировки) ---")
-    pivot_filtered = pivot[
-        (pivot[BASE_COL_RF].apply(lambda x: map_rf(x) == chelyabinsk_rf_norm)) &
-        (pivot[BASE_COL_SEGMENT].apply(lambda x: norm_text(x) == "топ"))
-    ]
-    print(f"   Найдено групп: {len(pivot_filtered)}")
-    print(pivot_filtered[[BASE_COL_SERVICE, BASE_COL_MRF, BASE_COL_RF,
-                          BASE_COL_SEGMENT, BASE_COL_SUBSEG, 'Эффект_тыс']].to_string(index=False))
+    _wait_calc = WaitingWindow("⏳ Идёт расчёт...",
+                               "Вычисляется эффект индексации.\nПожалуйста, подождите.")
+    t_calc = datetime.now()
+    try:
+        if charges_mode == MODE_EXTERNAL:
+            pivot = calc_pivot_external(df_base, df_amount, base_col,
+                                        id_col, amount_col, available_group_cols)
+        else:  # MODE_INBASE
+            pivot = calc_pivot_inbase(df_base, base_col, current_col, available_group_cols)
+    finally:
+        _wait_calc.close()
+    calc_sec = (datetime.now() - t_calc).total_seconds()
+    print(f"   Групп: {len(pivot)}, эффект: {pivot['Эффект_тыс'].sum():,.3f} тыс. руб. "
+          f"(расчёт: {calc_sec:.1f} сек)")
 
-    # 2. Фильтры, применённые в окне
-    print("\n--- 2. АКТИВНЫЕ ФИЛЬТРЫ ИЗ ОКНА ---")
+    if len(pivot) == 0:
+        print("   ❌ Пустой pivot — нет данных.")
+        return None
+
+    sel = filter_window(df_report, mrf_name=mrf_name)
+    if not sel or not sel.get("date") or sel.get("selected") is None:
+        print("  Фильтры не выбраны — база пропущена.")
+        return None
+
+    selected_date     = sel["date"]
+    selected_segments = sel.get("selected") or {}
+
+    svc_col_report = RPT_COL_SERVICE if RPT_COL_SERVICE in df_report.columns else None
+    if svc_col_report is None:
+        print(f"   ⚠️  В отчёте нет колонки '{RPT_COL_SERVICE}' — фильтр по услуге не применяется")
+    selected_services = set()
     for fc, fv in selected_segments.items():
-        print(f"   {fc}: {fv[:3]}{'...' if len(fv) > 3 else ''}")  # Показываем первые 3 значения для краткости
-    print(f"   Выбранная дата: {selected_date}")
+        if fc == "Услуга":
+            selected_services = set(fv); break
 
-    # 3. Данные из ОТЧЁТА, соответствующие этим фильтрам
-    print("\n--- 3. СТРОКИ В ОТЧЁТЕ ПО ДАТЕ И УСЛУГАМ (из report_dict) ---")
-    matching_keys = []
-    for key, idxs in report_dict.items():
-        svc, mrf, rf, seg, sub = key
-        if rf == chelyabinsk_rf_norm and seg == "топ":
-            matching_keys.append((svc, mrf, rf, seg, sub, idxs))
-    print(f"   Найдено строк в отчёте: {len(matching_keys)}")
-    for svc, mrf, rf, seg, sub, idxs in matching_keys[:5]:  # Показываем первые 5
-        print(f"   - Услуга='{svc}', МРФ='{mrf}', РФ='{rf}', Сег='{seg}', Под='{sub}', Индексы: {idxs[:3]}...")
+    # ══════════════════════════════════════════════════════════════
+    #  🐞 ДЕТАЛЬНАЯ ОТЛАДКА для ЧЕЛЯБИНСКОГО ФИЛИАЛА / ТОП
+    # ══════════════════════════════════════════════════════════════
+    # Определяем, обрабатывается ли сейчас целевая комбинация
+    is_chelyabinsk_top = False
+    chelyabinsk_rf_norm = norm_text(unmap_rf("Челябинский"))
+    for _, pr in pivot.iterrows():
+        rf_val = map_rf(pr[BASE_COL_RF]) if BASE_COL_RF in pr.index else ""
+        seg_val = norm_text(pr[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in pr.index else ""
+        if rf_val == chelyabinsk_rf_norm and seg_val == "топ":
+            is_chelyabinsk_top = True
+            break
 
-    # 4. Пошаговый расчёт ИТОГОВОЙ ЦИФРЫ для отчёта
-    print("\n--- 4. ПОШАГОВЫЙ РАСЧЁТ ИТОГОВОЙ ЦИФРЫ ДЛЯ ОТЧЁТА ---")
-    # Суммируем эффект по всем группам Челябинск/ТОП из PIVOT
-    total_effect_pivot = pivot_filtered['Эффект_тыс'].sum()
-    print(f"   Шаг 1: Сумма 'Эффект_тыс' по всем группам Челябинск/ТОП в PIVOT = {total_effect_pivot:.3f} тыс. руб.")
+    if is_chelyabinsk_top:
+        print("\n" + "="*70)
+        print("🐞 ДЕТАЛЬНАЯ ОТЛАДКА для ЧЕЛЯБИНСКОГО ФИЛИАЛА / СЕГМЕНТ ТОП")
+        print("="*70)
 
-    # Смотрим, сколько из этих групп уже есть в отчёте (будут обновлены)
-    existing_in_report = 0
-    effect_written_to_report = 0.0
-    for _, pr in pivot_filtered.iterrows():
-        svc = pr[BASE_COL_SERVICE] if BASE_COL_SERVICE in pr.index else ""
-        mrf = norm_text(pr[BASE_COL_MRF]) if BASE_COL_MRF in pr.index else ""
-        rf = map_rf(pr[BASE_COL_RF]) if BASE_COL_RF in pr.index else ""
-        seg = norm_text(pr[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in pr.index else ""
-        sub = norm_text(pr[BASE_COL_SUBSEG]) if BASE_COL_SUBSEG in pr.index else ""
-        key = (norm_text(svc), mrf, rf, seg, sub)
-        if key in report_dict:
-            existing_in_report += 1
-            effect_written_to_report += pr['Эффект_тыс']
+        # 1. Исходные данные из PIVOT
+        print("\n--- 1. ДАННЫЕ ИЗ PIVOT (после группировки) ---")
+        pivot_filtered = pivot[
+            (pivot[BASE_COL_RF].apply(lambda x: map_rf(x) == chelyabinsk_rf_norm)) &
+            (pivot[BASE_COL_SEGMENT].apply(lambda x: norm_text(x) == "топ"))
+        ]
+        print(f"   Найдено групп: {len(pivot_filtered)}")
+        if len(pivot_filtered) > 0:
+            print(pivot_filtered[[BASE_COL_SERVICE, BASE_COL_MRF, BASE_COL_RF,
+                                  BASE_COL_SEGMENT, BASE_COL_SUBSEG, 'Эффект_тыс']].to_string(index=False))
         else:
-            # Проверяем, есть ли строка с такой же комбинацией МРФ+РФ+Сег+Под (без учёта услуги)
-            key_no_svc = (mrf, rf, seg, sub)
-            for k_full in report_dict:
-                if (k_full[1], k_full[2], k_full[3], k_full[4]) == key_no_svc:
-                    existing_in_report += 1
-                    effect_written_to_report += pr['Эффект_тыс']
+            print("   (нет данных)")
+
+        # 2. Фильтры
+        print("\n--- 2. АКТИВНЫЕ ФИЛЬТРЫ ИЗ ОКНА ---")
+        for fc, fv in selected_segments.items():
+            display_vals = fv[:3] if len(fv) > 3 else fv
+            print(f"   {fc}: {display_vals}{'...' if len(fv) > 3 else ''}")
+        print(f"   Выбранная дата: {selected_date}")
+
+        # 3. Данные из отчёта
+        print("\n--- 3. СТРОКИ В ОТЧЁТЕ ПО ДАТЕ И УСЛУГАМ ---")
+        matching_keys = []
+        for key, idxs in report_dict.items():
+            svc, mrf, rf, seg, sub = key
+            if rf == chelyabinsk_rf_norm and seg == "топ":
+                matching_keys.append((svc, mrf, rf, seg, sub, idxs))
+        print(f"   Найдено строк в отчёте: {len(matching_keys)}")
+        for svc, mrf, rf, seg, sub, idxs in matching_keys[:5]:
+            print(f"   - Услуга='{svc}', РФ='{rf}', Сег='{seg}', Под='{sub}', Индексы: {idxs[:3]}...")
+
+        # 4. Пошаговый расчёт итоговой цифры
+        print("\n--- 4. ПОШАГОВЫЙ РАСЧЁТ ИТОГОВОЙ ЦИФРЫ ДЛЯ ОТЧЁТА ---")
+        total_effect_pivot = pivot_filtered['Эффект_тыс'].sum()
+        print(f"   Шаг 1: Сумма 'Эффект_тыс' по всем группам = {total_effect_pivot:.3f} тыс. руб.")
+
+        existing_in_report = 0
+        effect_written_to_report = 0.0
+        for _, pr in pivot_filtered.iterrows():
+            svc = pr[BASE_COL_SERVICE] if BASE_COL_SERVICE in pr.index else ""
+            mrf = norm_text(pr[BASE_COL_MRF]) if BASE_COL_MRF in pr.index else ""
+            rf = map_rf(pr[BASE_COL_RF]) if BASE_COL_RF in pr.index else ""
+            seg = norm_text(pr[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in pr.index else ""
+            sub = norm_text(pr[BASE_COL_SUBSEG]) if BASE_COL_SUBSEG in pr.index else ""
+            key = (norm_text(svc), mrf, rf, seg, sub)
+            if key in report_dict:
+                existing_in_report += 1
+                effect_written_to_report += pr['Эффект_тыс']
+            else:
+                key_no_svc = (mrf, rf, seg, sub)
+                for k_full in report_dict:
+                    if (k_full[1], k_full[2], k_full[3], k_full[4]) == key_no_svc:
+                        existing_in_report += 1
+                        effect_written_to_report += pr['Эффект_тыс']
+                        break
+        print(f"   Шаг 2: Уже есть в отчёте (будут ОБНОВЛЕНЫ): {existing_in_report} групп")
+        print(f"          Сумма эффекта: {effect_written_to_report:.3f} тыс. руб.")
+
+        added_groups = len(pivot_filtered) - existing_in_report
+        print(f"   Шаг 3: Будет ДОБАВЛЕНО новых строк: {added_groups} групп")
+        print(f"          Сумма эффекта: {total_effect_pivot - effect_written_to_report:.3f} тыс. руб.")
+
+        print(f"\n   ✅ ИТОГОВАЯ ЦИФРА для отчёта: {total_effect_pivot:.3f} тыс. руб.")
+        print("="*70 + "\n")
+
+    # Строим report_dict
+    report_dict = defaultdict(list)
+    for idx, row in df_report.iterrows():
+        rd = norm_date(row[RPT_COL_DATE]) if RPT_COL_DATE in df_report.columns else ""
+        if rd != norm_date(selected_date): continue
+        svc  = norm_text(row[svc_col_report]) if svc_col_report else ""
+        if selected_services and svc not in selected_services: continue
+        mrf_ = norm_text(row[RPT_COL_MRF])    if RPT_COL_MRF    in df_report.columns else ""
+        rf_  = map_rf(row[RPT_COL_RF])         if RPT_COL_RF     in df_report.columns else ""
+        seg_ = norm_text(row[RPT_COL_SEGMENT]) if RPT_COL_SEGMENT in df_report.columns else ""
+        sub_ = norm_text(row[RPT_COL_SUBSEG])  if RPT_COL_SUBSEG in df_report.columns else ""
+        report_dict[(svc, mrf_, rf_, seg_, sub_)].append(idx)
+
+    total_rpt = sum(len(v) for v in report_dict.values())
+    print(f"   Строк в отчёте по дате/фильтрам: {total_rpt}")
+    if total_rpt == 0:
+        print("   ℹ️  Строк с такой датой нет — все группы будут ДОБАВЛЕНЫ.")
+
+    # Отладка несовпадений
+    pivot_ks = set()
+    for _, r in pivot.iterrows():
+        pivot_ks.add((
+            norm_text(r[BASE_COL_MRF])     if BASE_COL_MRF     in r.index else "",
+            map_rf(r[BASE_COL_RF])         if BASE_COL_RF      in r.index else "",
+            norm_text(r[BASE_COL_SEGMENT]) if BASE_COL_SEGMENT in r.index else "",
+            norm_text(r[BASE_COL_SUBSEG])  if BASE_COL_SUBSEG  in r.index else "",
+        ))
+    report_ks = {(k[1], k[2], k[3], k[4]) for k in report_dict}
+    missing = pivot_ks - report_ks
+    if missing and total_rpt > 0:
+        print(f"   ⚠️  Ключей PIVOT без строки в отчёте: {len(missing)} → будут ДОБАВЛЕНЫ")
+        for k in list(missing)[:3]:
+            print(f"      МРФ='{k[0]}' РФ='{k[1]}' Сег='{k[2]}' Под='{k[3]}'")
+    elif not missing and total_rpt > 0:
+        print("   ✅ Все ключи PIVOT найдены — только обновление.")
+
+    # Строки отчёта у которых НЕТ совпадения в pivot → информируем пользователя
+    not_found_indices = []
+    not_found_details = []
+
+    # Строим pct_lookup
+    pct_col_report = find_col_name(df_report, RPT_COL_PCT)
+    pct_lookup = {}
+    if pct_col_report and total_rpt > 0:
+        for key_full, ridxs in report_dict.items():
+            mrf_k = key_full[1]; rf_k = key_full[2]
+            for ridx in ridxs:
+                val = df_report.loc[ridx, pct_col_report]
+                if pd.notna(val) and str(val).strip() not in ("", "0", "0.0"):
+                    pct_lookup[(mrf_k, rf_k)] = fmt_pct(val)
                     break
-    print(f"   Шаг 2: Из них уже есть в отчёте (будут ОБНОВЛЕНЫ): {existing_in_report} групп")
-    print(f"          Сумма эффекта по этим группам: {effect_written_to_report:.3f} тыс. руб.")
 
-    # Сколько групп будет добавлено как новые строки
-    added_groups = len(pivot_filtered) - existing_in_report
-    print(f"   Шаг 3: Будет ДОБАВЛЕНО новых строк: {added_groups} групп")
-    print(f"          Сумма эффекта по добавляемым группам: {total_effect_pivot - effect_written_to_report:.3f} тыс. руб.")
+    filter_mrfs = set(selected_segments.get("МРФ", []))
+    filter_rfs  = set(selected_segments.get("РФ", []))
 
-    # ИТОГОВАЯ ЦИФРА, которая попадёт в отчёт (сумма всех групп)
-    print(f"\n   ✅ ИТОГОВАЯ ЦИФРА для отчёта (сумма по Челябинск/ТОП): {total_effect_pivot:.3f} тыс. руб.")
-    print("="*70 + "\n")
+    if total_rpt > 0:
+        for key_full, ridxs in report_dict.items():
+            key_no_svc = (key_full[1], key_full[2], key_full[3], key_full[4])
+            row_mrf = key_full[1]
+            row_rf  = key_full[2]
+
+            if filter_mrfs and row_mrf not in filter_mrfs:
+                continue
+            if filter_rfs and row_rf not in filter_rfs:
+                continue
+
+            if key_no_svc not in pivot_ks:
+                for ridx in ridxs:
+                    try:
+                        cur = df_report.loc[ridx, target_col]
+                        if pd.isna(cur):
+                            df_report.loc[ridx, target_col] = 0
+                    except (TypeError, KeyError, IndexError):
+                        pass
+                not_found_indices.extend(ridxs)
+                svc_val = key_full[0]
+                seg_val = key_full[3]
+                sub_val = key_full[4]
+                not_found_details.append(
+                    f"      Услуга='{svc_val}' МРФ='{row_mrf}' РФ='{row_rf}' "
+                    f"Сег='{seg_val}' Под='{sub_val}'"
+                )
+
+        if not_found_details:
+            print(f"\n   ⚠️  Позиции из ОТЧЁТА (МРФ {mrf_name}), не найденные в базе индексации: {len(not_found_details)}")
+            print("   (строки выделены жёлтым, значение эффекта не изменено):")
+            for d in not_found_details[:15]:
+                print(d)
+            if len(not_found_details) > 15:
+                print(f"      ... и ещё {len(not_found_details) - 15} позиций")
+
+    messagebox.showinfo(
+        "Информация о несовпадениях",
+        f"Строк в отчёте по дате/фильтрам: {total_rpt}\n"
+        + (f"Ключей PIVOT без строки в отчёте: {len(missing)} → будут ДОБАВЛЕНЫ\n"
+           if missing and total_rpt > 0 else "")
+        + (f"Позиций не найдено в базе: {len(not_found_details)}"
+           if not_found_details else "Все позиции найдены в базе."),
+        parent=_get_file_root()
+    )
+
+    t_match = datetime.now()
+    _wait_match = WaitingWindow("⏳ Идёт сопоставление...",
+                                "Сопоставляются данные с отчётом.\nПожалуйста, подождите.")
+    print("   ⏳ Сопоставление с отчётом, пожалуйста подождите...")
+    try:
+        print("\n   --- Активные фильтры из окна ---")
+        for fc, fv in selected_segments.items():
+            print(f"   {fc}: {fv}")
+        if not selected_segments:
+            print("   (фильтры не заданы — обрабатываются все группы)")
+        print()
+
+        updated_count = 0; added_count = 0
+        matched_indices = []; added_indices = []
+        skipped_by_filter = []
+
+        svcs_check = selected_services if selected_services else {k[0] for k in report_dict}
+        if total_rpt == 0: svcs_check = None
+
+        for _, pr in pivot.iterrows():
+            mrf_ = norm_text(pr[BASE_COL_MRF])     if BASE_COL_MRF     in pr.index else ""
+            rf_  = map_rf(pr[BASE_COL_RF])          if BASE_COL_RF      in pr.index else ""
+            seg_ = norm_text(pr[BASE_COL_SEGMENT])  if BASE_COL_SEGMENT in pr.index else ""
+            sub_ = norm_text(pr[BASE_COL_SUBSEG])   if BASE_COL_SUBSEG  in pr.index else ""
+
+            ok = True
+            skip_reason = ""
+            for fc, fv in selected_segments.items():
+                if   fc == "Услуга":                 continue
+                elif fc == "МРФ"             and mrf_ not in fv:
+                    ok = False; skip_reason = f"МРФ '{mrf_}' не в {fv}"; break
+                elif fc == "РФ"              and rf_  not in fv:
+                    ok = False; skip_reason = f"РФ '{rf_}' не в фильтре РФ"; break
+                elif fc == "Краткий Сегмент" and seg_ not in fv:
+                    ok = False; skip_reason = f"Сегмент '{seg_}' не в {fv}"; break
+                elif fc == "Подсегмент"      and sub_ not in fv:
+                    ok = False; skip_reason = f"Подсегмент '{sub_}' не в {fv}"; break
+            if not ok:
+                skipped_by_filter.append(
+                    f"   ✗ ПРОПУЩЕНО ({skip_reason}): МРФ='{mrf_}' РФ='{rf_}' Сег='{seg_}' Под='{sub_}' Эфф={pr['Эффект_тыс']:.3f}"
+                )
+                continue
+
+            eff = pr['Эффект_тыс']
+
+            if total_rpt > 0:
+                sc_list = list(svcs_check) if svcs_check else [None]
+                found_any = False
+                for svc in sc_list:
+                    key = (svc, mrf_, rf_, seg_, sub_)
+                    if key in report_dict:
+                        for ridx in report_dict[key]:
+                            df_report.loc[ridx, target_col] = eff
+                            matched_indices.append(ridx); updated_count += 1
+                        found_any = True
+
+                if not found_any:
+                    key_no_svc = (mrf_, rf_, seg_, sub_)
+                    existing_no_svc = {(k[1], k[2], k[3], k[4]) for k in report_dict}
+                    if key_no_svc in existing_no_svc:
+                        for key_full, ridxs in report_dict.items():
+                            if (key_full[1], key_full[2], key_full[3], key_full[4]) == key_no_svc:
+                                for ridx in ridxs:
+                                    df_report.loc[ridx, target_col] = eff
+                                    matched_indices.append(ridx); updated_count += 1
+                                found_any = True
+                                break
+
+                if not found_any:
+                    svc_val = list(svcs_check)[0] if svcs_check else ""
+                    new_row = _build_new_row(df_report, pr, svc_val, selected_date, target_col, eff, pct_lookup)
+                    df_report = pd.concat([df_report, pd.DataFrame([new_row])], ignore_index=True)
+                    added_indices.append(len(df_report) - 1); added_count += 1
+
+            else:
+                if BASE_COL_SERVICE in pr.index and pd.notna(pr[BASE_COL_SERVICE]):
+                    svc_val = str(pr[BASE_COL_SERVICE]).strip()
+                else:
+                    svc_val = list(selected_services)[0] if selected_services else ""
+                new_row = _build_new_row(df_report, pr, svc_val, selected_date, target_col, eff, pct_lookup)
+                df_report = pd.concat([df_report, pd.DataFrame([new_row])], ignore_index=True)
+                added_indices.append(len(df_report) - 1); added_count += 1
+
+        if skipped_by_filter:
+            print(f"   ⚠️  Пропущено фильтрами: {len(skipped_by_filter)} групп")
+            for s in skipped_by_filter[:10]:
+                print(s)
+            if len(skipped_by_filter) > 10:
+                print(f"   ... и ещё {len(skipped_by_filter)-10} групп")
+    finally:
+        _wait_match.close()
+    match_sec = (datetime.now() - t_match).total_seconds()
+    print(f"   ✓ Записано строк: {updated_count}")
+    print(f"   ✓ Добавлено новых строк: {added_count}")
+    print(f"   ⏱ Сопоставление заняло: {match_sec:.1f} сек")
+    return updated_count, added_count, matched_indices, added_indices, \
+           not_found_indices, pivot['Эффект_тыс'].sum(), df_report
